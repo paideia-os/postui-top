@@ -1,0 +1,132 @@
+# postui-top — caps.decl
+#
+# Wave: postui v1 reference apps
+# Milestone: M1 (scaffold + sys_taskinfo poll loop)
+# Doc:  paideia-os/postui/docs/design.md §3.1 (widget mix + data
+#       source for /bin/top); paideia-os/postui/design/architecture.md
+#       §5.1 (error-band allocation table).
+#
+# postui-top is the top(1)-style task viewer that consumes the postui
+# widget library at exec time. Its cap footprint at M1-001 covers
+# every substrate the poll + eventual render paths will touch — the
+# scaffold declares the full set up front so the M2 render-landing and
+# M4 semantic-pipe-emit landings do not need to reopen the manifest
+# for a re-sign.
+#
+# ---------------------------------------------------------------------
+# KIND_TUI_CANVAS — the render substrate (postui/docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# postui-top holds one canvas cap per rendering surface (single canvas
+# for the fullscreen top view at M2; the M3 tabs view stays inside
+# one canvas via sub-region draws rather than a compositor split).
+#
+# Rights layout (mirrors R_TTY_* discipline; see postui/docs/design.md
+# §2.1 "Rights" table):
+#
+#   R_TUI_PRESENT   0x002   diff + emit a frame (the write analogue)
+#   R_TUI_INVOKE    0x008   query ops (rows, cols, id, tty_id)
+#   R_TUI_RESIZE    0x010   TUI_OP_RESIZE / TUI_OP_CLEAR
+#   R_TUI_REVOKE    0x020   teardown the row
+#   R_TUI_MINT      0x200   derive a canvas from a KIND_MEMORY parent
+#   R_TUI_OBSERVE   0x400   debug printer
+#
+# At M1-001 postui-top's poll module (src/poll.pdx) does NOT touch the
+# canvas — the sys_taskinfo poll runs before any render. The mint and
+# present rights are declared HERE so the M1-005 render landing (which
+# introduces terminal_init + frame_render + frame_present through
+# postui) does not need a caps.decl churn:
+#
+#   * mint    — postui-top mints its top-level canvas at Main::main
+#               startup via sys_cap_derive against a KIND_MEMORY parent
+#               (M1-005 landing).
+#   * present — every frame_render tail invokes TUI_OP_PRESENT via
+#               postui's tcc_present wrapper (M2-onwards render path).
+#
+# R_TUI_INVOKE / R_TUI_RESIZE / R_TUI_REVOKE are DEFERRED (declared at
+# M1-005 when the render path first exercises them); adding them at
+# this landing would over-declare authority the M1-001 poll surface
+# never uses.
+#
+# ---------------------------------------------------------------------
+# KIND_TTY — the input + physical-sink substrate (postui/docs/design.md
+# §2.5)
+# ---------------------------------------------------------------------
+#
+# Two independent uses (mirror postui's own caps.decl):
+#
+#   * write — the canvas is provably wired to a live KIND_TTY at mint
+#     time (postui/docs/design.md §2.1: the row's tty_slot is validated
+#     via tty_tail_valid at cap_handler_tui_canvas mint). TUI_OP_PRESENT
+#     emits its ANSI byte stream through the tty_slot; the write right
+#     is transitively required at postui-top mint time even though
+#     postui-top code never issues TTY_OP_WRITE itself.
+#
+#   * read — the primary input path once postui.M4-007 lands (Terminal::
+#     terminal_read_input probes KIND_TTY raw-mode). The M1-001 poll
+#     surface never reads input; declared here so the M3 tabs-toggle
+#     landing does not need to widen the manifest.
+#
+# ---------------------------------------------------------------------
+# KIND_MEMORY — the canvas backing store (postui/docs/design.md §2.1)
+# ---------------------------------------------------------------------
+#
+# KIND_TUI_CANVAS derives over KIND_MEMORY (= KIND_PAGE, 4). postui-top
+# mints a KIND_MEMORY region sized 2 * rows * cols * CELL_BYTES at
+# M1-005 startup and hands it to sys_cap_derive(KIND_TUI_CANVAS, ...);
+# the derived canvas cap is what postui subsequently invokes for every
+# PRESENT. The KIND_MEMORY authority is not held beyond the derive.
+#
+requires:
+- KIND_TUI_CANVAS(mint, present)
+- KIND_TTY(write, read)
+- KIND_MEMORY(mint, revoke)
+
+# ---------------------------------------------------------------------
+# Syscall dependencies (informational; not consumed by the InitCap
+# sidecar — the syscall gate is a kernel-side dispatch decision, not a
+# per-process cap check at M1). Enumerated here so downstream tooling
+# (release lint, dependency-audit) that walks the tree can trace
+# postui-top's SC+ surface without reading every .pdx source.
+#
+# The M1-001 poll path uses exactly two syscalls beyond what postui's
+# own render path already declares:
+#
+#   * sysno 66 — sys_clock_read_ns() -> u64 ns
+#                Monotonic ns-since-boot counter. PollLoop uses it to
+#                gate the fixed-interval poll_tick refresh (converting
+#                the interval_ticks arg to a compatible ns-domain
+#                deadline via shift, per src/poll.pdx §Tick semantics).
+#   * sysno 83 — sys_taskinfo(idx, user_buf_va) -> 0|-ENOENT|-ESRCH|-EFAULT
+#                Ring-3 task-table introspection (design/user/syscall-
+#                table.md row 83, paideia-os). Fills a 64-byte record
+#                per live task; poll_tick iterates idx = 0..row_cap and
+#                transcodes into the postui-top 48-byte task_row form.
+# ---------------------------------------------------------------------
+syscalls:
+- sys_clock_read_ns @ 66
+- sys_taskinfo      @ 83
+
+# ---------------------------------------------------------------------
+# Declared output schemas
+# ---------------------------------------------------------------------
+#
+# postui-top emits one first-class semantic-pipe schema at M4-004:
+#
+#   * TaskRow@0.1 — one record per live task, mirroring the internal
+#                   task_row struct (pid u64, state u64, ticks_cpu u64,
+#                   mem_kb u64, name_ptr u64, name_len u64 = 48B).
+#                   Emitted through the KIND_IPC_ENDPOINT postui-top
+#                   binds at Main::main startup (M2-005 wire-in). Every
+#                   downstream scraper (e.g. a monitoring daemon that
+#                   pulls TaskRow via `top | scraper`) reads the same
+#                   32-byte-BLAKE3 schema hash under the libpdx-
+#                   semantic-pipe v1 contract.
+#
+# At M1-001 the emitter path is scaffolding only (poll.pdx populates
+# the in-memory row set; no envelope encoder runs). The schema name
+# is declared here so the M4-004 landing does not need to introduce
+# it and the downstream dependency-audit tree already sees postui-top
+# as a TaskRow producer.
+declares_output_schemas:
+- TaskRow@0.1

@@ -1,0 +1,565 @@
+// src/poll.pdx -- postui-top.M1-001 (paideia-os/postui-top#1)
+//
+// Poll module: PollState struct + fixed-tick sys_taskinfo poll loop.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1 postui-top reference app)
+// =============================================================================
+//
+// The M1-001 landing seeds postui-top's data-source path: at a fixed
+// interval, iterate sys_taskinfo (SC+ sysno 83) across the task pool
+// and transcode each returned 64-byte kernel record into postui-top's
+// 48-byte normalized task_row form the M2 Table widget draws. This
+// module ships two callable entry points (poll_init, poll_tick) plus
+// the constants + backing storage they consume; no widget code, no
+// canvas invocation, no semantic-pipe emission runs at this landing
+// (those land at M2 / M4 respectively per this repo's STATUS.md).
+//
+// The postui.M1 dependency (v1.0.0, tag postui-v1.0.0) is a link-time
+// consumer at M2+; M1-001 uses zero postui symbols and compiles as a
+// stand-alone object under build-out/poll.o via tools/build.sh.
+//
+// =============================================================================
+// MODULE NAME DEVIATION
+// =============================================================================
+//
+// The M1-001 issue text names the module `PollLoop`, but paideia-as's
+// `module-basename-pascal` invariant (manifest.pdxproj compliance flag,
+// enforced by the encoder's module-basename-mismatch refusal per the
+// pdx-encoder pitfall log) requires the module name to match the file
+// basename PascalCased. File is `poll.pdx` -> module `Poll`. Every
+// external caller reaches this surface via the six pub let names
+// below (POLL_STATE_BYTES / POLL_ROW_BYTES / poll_init / poll_tick /
+// PL_ERR_*); the enclosing module qualifier is a fingerprint marker
+// only and does not appear in the linker symbol table. Renaming the
+// file to poll_loop.pdx (and this to module PollLoop) is a mechanical
+// M1-002 refactor if the design owner wants the name to match the
+// issue text — the source is otherwise identical.
+//
+// =============================================================================
+// SC+ SYSCALL DEPENDENCIES (design/user/syscall-table.md, paideia-os)
+// =============================================================================
+//
+//   * sysno 66 = sys_clock_read_ns()          -> u64 ns since boot
+//   * sysno 83 = sys_taskinfo(idx, user_buf)  -> 0 | -ENOENT | -ESRCH | -EFAULT
+//
+// sys_taskinfo IS live at paideia-os HEAD (kernel body at src/kernel/
+// core/syscall/sys_taskinfo.pdx, R57.M4-003 landing + R60.M7-002
+// 64-byte-record extension). No stub is required — the syscall
+// number is real and the record shape is frozen at 64 bytes per
+// src/kernel/core/sched/task_info.pdx §Record layout.
+//
+// =============================================================================
+// TICK SEMANTICS
+// =============================================================================
+//
+// The M1-001 issue names the interval in "ticks" (poll_interval_ticks
+// / last_poll_tick), but no user-facing SC+ syscall exposes the
+// kernel's _tick_count directly today — the closest surface is sysno
+// 66 sys_clock_read_ns() returning ns since boot (paideia-os
+// int/exceptions.pdx tag_sys_clock_read_ns_ok). PollLoop converts by
+// treating one "tick" as 2^24 ns = 16.7ms — a right-shift-by-24
+// conversion that is encoder-safe (single shr, no imul, no div) and
+// close enough to the 10ms LAPIC tick period the design-doc §3.1
+// interval sizing assumes (top(1)-style refresh at 250ms - 1s is
+// insensitive to a 6.7ms constant scaling). The exact ratio (10ms
+// per kernel tick) becomes reachable once a `sys_get_tick_count`
+// SC+ syscall lands — tracked as a M1-002 deferred hardening item;
+// swapping the conversion touches PL_TICK_SHIFT in exactly one
+// place.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`Poll`), matches file basename
+//     poll.pdx.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). Large
+//     sentinels (0xFFFFEC0x band) are only used in `mov reg, imm`
+//     form -- paideia-as emits the 10-byte movabs encoding for
+//     imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all. Every
+//     multiplication in the loop uses `shl reg, N` (row-size 48
+//     factors: mul-by-48 = shl 4 + add + shl 1, but we use a plain
+//     row-stride add off a base register instead — see pl_iter body).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare is `mov reg, [mem]; cmp reg, other`).
+//   - r11 is scratch (paideia-as reserved). Nothing in this module
+//     touches r11 -- syscall clobbers rcx/r11 CPU-side but r11 is
+//     SysV caller-save so cross-call preservation is not our concern.
+//   - `xor reg, reg; mov_b reg, [ptr]` shape for every byte load
+//     (used only in pl_namelen for the strnlen scan).
+//   - Every function that issues a nested call pushes an ODD count of
+//     8-byte callee-save registers so `rsp % 16 == 0` at the call
+//     boundary (SysV entry rsp%16==8; +5 pushes = 40 -> %16==0).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `pl_*` per the M1-001 issue's fingerprint discipline. Substring
+//     "loop" avoided defensively (labels use `_iter_` / `_scan_`).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+
+module Poll = structure {
+
+  // ==========================================================================
+  // Error band (postui-top's wave-scoped high-nibble discriminator).
+  //
+  // The M1-001 issue reserves 0xFFFFEC00..0xFFFFEC0F for postui-top;
+  // this band is disjoint from postui's own 0xFFFFEB80..0xFFFFEB8F
+  // library band (see postui/src/lib.pdx POSTUI_ERR_BAND_BASE) and
+  // from every kernel-side band the postui pipeline touches
+  // (KIND_TUI_CANVAS 0xFFFFEB10..1F, KIND_TTY 0xFFFFEB20..2F,
+  // KIND_SIG_KEY 0xFFFFEB00..0F). A downstream consumer can `shr
+  // rax, 4` and switch on the band nibble to attribute a refusal
+  // to postui-top vs postui vs the kernel.
+  //
+  // Sentinels within the postui-top band are allocated bottom-up:
+  //   +0  PL_ERR_BAD_STATE_PTR      poll_init/tick with a null state
+  //   +1  PL_ERR_BAD_ROWS_PTR       poll_init with a null rows_ptr
+  //   +2  PL_ERR_BAD_ROW_CAP        poll_init with row_cap == 0
+  //   +3  PL_ERR_INTERVAL_ZERO      poll_init with interval_ticks == 0
+  //   +4..+F  reserved for M1-002+  (poll refresh failure, transcode
+  //                                  bounds, semantic-pipe emit refuse)
+  //
+  // The M1-001 poll_init / poll_tick bodies DO NOT validate their
+  // arguments at this landing -- caller bugs surface as segfaults or
+  // wrong-row data rather than as sentinel returns. The sentinels are
+  // reserved here so the M1-002 defensive-gate landing does not need
+  // to introduce them.
+  // ==========================================================================
+  pub let POSTUI_TOP_OK                : u64 = 0
+  pub let POSTUI_TOP_ERR_BAND_BASE     : u64 = 0xFFFFEC00
+  pub let POSTUI_TOP_ERR_BAND_TOP      : u64 = 0xFFFFEC0F
+
+  pub let PL_ERR_BAD_STATE_PTR         : u64 = 0xFFFFEC00
+  pub let PL_ERR_BAD_ROWS_PTR          : u64 = 0xFFFFEC01
+  pub let PL_ERR_BAD_ROW_CAP           : u64 = 0xFFFFEC02
+  pub let PL_ERR_INTERVAL_ZERO         : u64 = 0xFFFFEC03
+
+  // ==========================================================================
+  // Kernel-side sys_taskinfo error sentinels (mirror src/kernel/core/
+  // sched/task_info.pdx TASK_INFO_ERR_* -- byte-for-byte identical).
+  // Reserved here so poll_tick's per-slot skip logic can name them
+  // symbolically once M1-002 introduces the -ESRCH-stops-iteration
+  // refinement (M1-001 treats any non-zero return as "skip this slot,
+  // continue" -- see pl_iter body).
+  // ==========================================================================
+  pub let PL_TI_ERR_ENOENT : u64 = 0xFFFFFFFFFFFFFFFE   // -2, empty slot
+  pub let PL_TI_ERR_ESRCH  : u64 = 0xFFFFFFFFFFFFFFFD   // -3, idx past end
+  pub let PL_TI_ERR_EFAULT : u64 = 0xFFFFFFFFFFFFFFF2   // -14, bad user buf
+
+  // ==========================================================================
+  // PollState layout (256 bytes, 32 qwords, @align(64) -- one L2 line).
+  //
+  //   [+0]    task_rows_ptr        (u64)   caller-provided rows base
+  //   [+8]    task_row_count       (u64)   filled by last poll_tick;
+  //                                        0 until first refresh
+  //   [+16]   task_row_cap         (u64)   caller-provided capacity
+  //                                        (max rows the buffer holds)
+  //   [+24]   poll_interval_ticks  (u64)   fixed refresh interval
+  //   [+32]   last_poll_tick       (u64)   monotonic-clock tick
+  //                                        (ns >> PL_TICK_SHIFT) of
+  //                                        the last completed refresh;
+  //                                        0 pre-first-refresh so the
+  //                                        first poll_tick always fires
+  //   [+40..+255] reserved                 216 bytes of growth room
+  //                                        (SIGWINCH counter, per-slot
+  //                                        latency histogram, refresh-
+  //                                        error counters at M1-002+)
+  //
+  // Chosen at 256 bytes rather than a tighter 64 so the M2-M4 landings
+  // grow into the reserved region without another struct-resize churn;
+  // the total footprint is one L1D cache line for the hot header + one
+  // L2 line for the whole struct.
+  // ==========================================================================
+  pub let POLL_STATE_BYTES              : u64 = 256
+
+  pub let POLL_OFF_TASK_ROWS_PTR        : u64 = 0
+  pub let POLL_OFF_TASK_ROW_COUNT       : u64 = 8
+  pub let POLL_OFF_TASK_ROW_CAP         : u64 = 16
+  pub let POLL_OFF_POLL_INTERVAL_TICKS  : u64 = 24
+  pub let POLL_OFF_LAST_POLL_TICK       : u64 = 32
+  pub let POLL_OFF_RESERVED             : u64 = 40
+
+  // ==========================================================================
+  // task_row layout (48 bytes per row, 6 u64 slots -- the M2 Table
+  // widget reads through these offsets rather than magic literals).
+  //
+  //   [+0]   pid         (u64)   from kernel record +0..+3, zero-extended
+  //   [+8]   state       (u64)   from kernel record +8..+11, zero-extended
+  //                              (0=NEW, 1=RUNNABLE, 2=RUNNING, 3=BLOCKED,
+  //                               4=EXITED per src/kernel/core/sched/
+  //                               state.pdx)
+  //   [+16]  ticks_cpu   (u64)   from kernel record +32..+39 (u64
+  //                              cumulative 100 Hz LAPIC ticks the task
+  //                              was _current_tcb)
+  //   [+24]  mem_kb      (u64)   derived from kernel record +40..+47
+  //                              (rss_pages) via shl 2 (4 KiB pages ->
+  //                              KiB); rss_pages is hard-coded 0 at
+  //                              R60.M7-002 so mem_kb is always 0
+  //                              until the paideia-os PML4-walker
+  //                              landing (see task_info.pdx §rss_pages)
+  //   [+32]  name_ptr    (u64)   -> _pl_names[row_out_idx * 16], a
+  //                              16-byte NUL-padded name slot; stable
+  //                              across poll_tick calls (rewritten in
+  //                              place)
+  //   [+40]  name_len    (u64)   strnlen of the name slot, cap 16;
+  //                              0 = zero-length name (kernel returns
+  //                              zeros pre-M1-comm[16] wiring in
+  //                              task_pool.pdx)
+  //
+  // The row shape is chosen so the M4-004 TaskRow@0.1 semantic-pipe
+  // schema (see caps.decl declares_output_schemas) can be emitted
+  // BYTE-FOR-BYTE from this in-memory layout via a single copy-out:
+  // the schema wire format is exactly these 48 bytes plus the 32-byte
+  // BLAKE3 envelope header that libpdx-semantic-pipe prepends.
+  // ==========================================================================
+  pub let POLL_ROW_BYTES : u64 = 48
+
+  pub let POLL_ROW_OFF_PID       : u64 = 0
+  pub let POLL_ROW_OFF_STATE     : u64 = 8
+  pub let POLL_ROW_OFF_TICKS_CPU : u64 = 16
+  pub let POLL_ROW_OFF_MEM_KB    : u64 = 24
+  pub let POLL_ROW_OFF_NAME_PTR  : u64 = 32
+  pub let POLL_ROW_OFF_NAME_LEN  : u64 = 40
+
+  // ==========================================================================
+  // Row-cap ceiling (matches src/kernel/core/sched/task_pool.pdx
+  // MAX_PIDS = 64 at paideia-os HEAD). PollLoop iterates idx = 0 up
+  // to min(row_cap, PL_MAX_ROWS) -- a row_cap > 64 wastes syscalls
+  // but does not corrupt state (each -ESRCH return simply skips).
+  // ==========================================================================
+  pub let PL_MAX_ROWS : u64 = 64
+
+  // ==========================================================================
+  // sys_taskinfo record size (mirror of TASK_INFO_RECORD_BYTES in
+  // src/kernel/core/sched/task_info.pdx). Frozen at 64 bytes at
+  // R60.M7-002 (#1817); a future record-shape evolution touches this
+  // one constant.
+  // ==========================================================================
+  pub let PL_TASKINFO_REC_BYTES : u64 = 64
+
+  // Kernel record offsets (see task_info.pdx §Record layout).
+  pub let PL_TIR_OFF_PID        : u64 = 0
+  pub let PL_TIR_OFF_STATE      : u64 = 8
+  pub let PL_TIR_OFF_NAME       : u64 = 16
+  pub let PL_TIR_OFF_CPU_TICKS  : u64 = 32
+  pub let PL_TIR_OFF_RSS_PAGES  : u64 = 40
+  pub let PL_TIR_OFF_START_TICK : u64 = 48
+
+  // ==========================================================================
+  // SC+ sysno constants (design/user/syscall-table.md, paideia-os).
+  // Named locally so the two syscall wrappers below (pl_sys_clock_ns
+  // + pl_sys_taskinfo) name the SC+ ID in exactly one place per call;
+  // matches the shell/src/syscall.pdx SYS_* discipline.
+  // ==========================================================================
+  pub let PL_SYS_CLOCK_READ_NS : u64 = 66
+  pub let PL_SYS_TASKINFO      : u64 = 83
+
+  // ==========================================================================
+  // Tick conversion. See §TICK SEMANTICS above -- one tick = 2^24 ns
+  // = 16.7ms at M1-001. Encoded as a shift constant so every
+  // conversion site (`shr rax, 24`) is a single instruction and the
+  // ratio is trivially auditable in this one place.
+  // ==========================================================================
+  pub let PL_TICK_SHIFT : u64 = 24
+
+  // ==========================================================================
+  // Scratch storage. _pl_scratch receives one raw 64-byte taskinfo
+  // record per sys_taskinfo call; _pl_names holds 64 * 16 = 1024
+  // bytes of NUL-padded name slots (one per row_out_idx). Both live
+  // in .bss (zero-initialized at load); the pl_iter body overwrites
+  // them per-call. Sized so PL_MAX_ROWS * 16 fills _pl_names exactly.
+  // ==========================================================================
+  pub let mut _pl_scratch : [u8; 64]   = uninit @align(8)
+  pub let mut _pl_names   : [u8; 1024] = uninit @align(8)
+
+  // ==========================================================================
+  // pl_sys_clock_ns() -> u64 ns
+  //
+  // Thin wrapper around SC+ sysno 66 (sys_clock_read_ns). Returns
+  // monotonic ns since boot in rax. Nullary; no arg shuffle needed.
+  // Kernel body at src/kernel/core/syscall/handlers/clock_read_ns.pdx
+  // (paideia-os R31.M2-001 #1582).
+  //
+  // Leaf: syscall clobbers rcx/r11 (both SysV caller-save, harmless).
+  // Effect {sysreg} + no capability -- the syscall path itself needs
+  // the sysreg union but clock_read_ns has no cap gate.
+  // ==========================================================================
+  pub let pl_sys_clock_ns : () -> u64 !{sysreg} @{} =
+    fn () -> unsafe {
+      effects: {sysreg}, capabilities: {},
+      justification: "postui-top.M1-001 (postui-top#1): SC+ sysno 66 (sys_clock_read_ns) wrapper. Nullary -- no SysV-to-SYSCALL arg shuffle. mov rax, 66; syscall; ret. Kernel body at paideia-os src/kernel/core/syscall/handlers/clock_read_ns.pdx returns _tick_count * 10_000_000 into rax (ns since boot). Leaf: rcx/r11 SYSCALL-clobbered, both SysV caller-save. Sole poll_tick consumer -- the returned ns is right-shifted by PL_TICK_SHIFT (24) to get an approximate tick count for last_poll_tick / poll_interval_ticks comparisons.",
+      block: {
+        mov rax, 66;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // pl_sys_taskinfo(idx, user_buf) -> u64
+  //
+  // Thin wrapper around SC+ sysno 83 (sys_taskinfo). Fills the 64-byte
+  // record for task-pool index `idx` into the user buffer at `user_buf`.
+  // Returns 0 on success, or one of the PL_TI_ERR_* sentinels below
+  // (kernel forwards task_get_info's rax verbatim; see src/kernel/
+  // core/syscall/sys_taskinfo.pdx §Contract).
+  //
+  // SysV rdi/rsi -> SYSCALL rdi/rsi (no shuffle; arity 2 < 4). Leaf.
+  //
+  // Effect row `!{mem, sysreg}` because the kernel writes up to 64
+  // bytes into the caller's user_buf. No capability (@{}) at M1 --
+  // the future M1+ policy (KIND_TASKINFO with R_INTROSPECT rights)
+  // will land at the dispatch shim, not this userspace wrapper.
+  // ==========================================================================
+  pub let pl_sys_taskinfo : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (idx: u64) (user_buf: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-top.M1-001 (postui-top#1): SC+ sysno 83 (sys_taskinfo) wrapper. SysV rdi=idx / rsi=user_buf pass through unchanged to SYSCALL rdi/rsi (arity 2). mov rax, 83; syscall; ret. Kernel dispatch at src/kernel/core/syscall/dispatch.pdx dispatch_taskinfo does the user_ptr_ok gate + walker-copy from the kernel scratch back to user_buf. Body at src/kernel/core/syscall/sys_taskinfo.pdx forwards to task_get_info; returns 0 on success (64B record written), 0xFFFFFFFFFFFFFFFE (-ENOENT, empty slot), 0xFFFFFFFFFFFFFFFD (-ESRCH, idx past MAX_PIDS=64), or 0xFFFFFFFFFFFFFFF2 (-EFAULT, bad user_buf). Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). Sole consumer: pl_iter's per-slot refresh in poll_tick body.",
+      block: {
+        mov rax, 83;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // poll_init(state_ptr, rows_ptr, row_cap, interval_ticks) -> u64
+  //
+  // Initialize a PollState struct in caller-provided memory. Writes
+  // every non-reserved field; the reserved region (+40..+255) is left
+  // as-is (caller is expected to zero the struct before the first
+  // poll_init if the growth region matters). last_poll_tick is
+  // explicitly zeroed so the first poll_tick always fires the refresh
+  // path (0 + any positive interval is trivially "elapsed" against
+  // any positive current tick).
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a >=256B struct
+  //   rsi = rows_ptr          VA of a row_cap * 48-byte row buffer
+  //   rdx = row_cap           max rows (typical /bin/top usage: 64)
+  //   rcx = interval_ticks    refresh interval in 2^24-ns units
+  //   -> rax = 0              always (no validation at M1-001; PL_ERR_*
+  //                           sentinels are reserved for M1-002)
+  //
+  // Register plan: zero pushes needed (no nested calls). All work is
+  // register-immediate stores through rdi. rsi/rdx/rcx are read once
+  // each into the destination struct; no scratch registers needed.
+  //
+  // Labels: none (linear body, no branches).
+  // ==========================================================================
+  pub let poll_init : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (state_ptr: u64) (rows_ptr: u64) (row_cap: u64) (interval_ticks: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M1-001 (postui-top#1): PollState field-stamp initializer. Contract SysV rdi=state_ptr, rsi=rows_ptr, rdx=row_cap, rcx=interval_ticks. Body writes six u64 slots through rdi: [+0]=rsi (task_rows_ptr), [+8]=0 (task_row_count -- xor rax,rax; mov [rdi+8], rax), [+16]=rdx (task_row_cap), [+24]=rcx (poll_interval_ticks), [+32]=0 (last_poll_tick -- reuses the zeroed rax; store STRICTLY BEFORE the return so a partial-init leaves last_poll_tick at whatever the caller pre-zeroed). Reserved region [+40..+255] left as-is (caller-owned pre-init). Return xor rax, rax (0=OK). No validation at this landing -- caller bugs (null state_ptr, row_cap==0) surface as segfaults or wrong-row data; the PL_ERR_* sentinels reserved above land defensive gates at M1-002. Zero pushes / pops -- no callee-save touched, no nested call. rdi/rsi/rdx/rcx are all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem]. Every field offset (+0/+8/+16/+24/+32) fits imm8. Leaf.",
+      block: {
+        // [+0] task_rows_ptr = rsi
+        mov [rdi + 0], rsi;
+        // [+16] task_row_cap = rdx
+        mov [rdi + 16], rdx;
+        // [+24] poll_interval_ticks = rcx
+        mov [rdi + 24], rcx;
+        // Zero task_row_count and last_poll_tick.
+        xor rax, rax;
+        mov [rdi + 8], rax;
+        mov [rdi + 32], rax;
+        // rax = 0 (POSTUI_TOP_OK).
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // poll_tick(state_ptr) -> u64
+  //
+  // The fixed-interval refresh entry. Called every application loop
+  // step; either refreshes the task_rows buffer (returning 1) or
+  // no-ops when the interval has not yet elapsed (returning 0).
+  //
+  // Contract:
+  //   rdi = state_ptr         VA of a PollState struct populated by
+  //                           poll_init
+  //   -> rax = 1              refreshed -- task_rows[0..count] and
+  //                           task_row_count / last_poll_tick updated
+  //   -> rax = 0              not yet -- interval has not elapsed
+  //                           since the last refresh; state unchanged
+  //
+  // Algorithm:
+  //   1. now_tick = pl_sys_clock_ns() >> PL_TICK_SHIFT
+  //   2. If now_tick - last_poll_tick < poll_interval_ticks -> return 0
+  //      (unsigned subtract; the `< interval` branch skips.)
+  //   3. Iterate idx = 0 .. min(row_cap, PL_MAX_ROWS):
+  //      a. pl_sys_taskinfo(idx, &_pl_scratch)
+  //      b. If rax != 0 -> skip this slot (ENOENT / ESRCH / EFAULT all
+  //         fall into the same skip path at M1-001; the -ESRCH-stops-
+  //         iteration refinement is a M1-002 hardening item).
+  //      c. Transcode _pl_scratch -> task_rows[out_idx * 48]:
+  //         - pid   = zext32(scratch[+0..+4])
+  //         - state = zext32(scratch[+8..+12])
+  //         - ticks_cpu = scratch[+32..+40]
+  //         - mem_kb    = scratch[+40..+48] << 2 (rss_pages -> KiB)
+  //         - name_ptr  = &_pl_names[out_idx * 16]; copy 16B from
+  //                       scratch[+16..+32]; name_len = strnlen(name_ptr, 16)
+  //      d. out_idx += 1
+  //   4. task_row_count = out_idx; last_poll_tick = now_tick
+  //   5. return 1
+  //
+  // Register plan: 5-push callee-save prologue (rbx / r12 / r13 / r14
+  // / r15) = 40 bytes -> SysV entry rsp%16==8, +40 -> rsp%16==0. Every
+  // nested call (pl_sys_clock_ns, pl_sys_taskinfo) sees the aligned
+  // stack. Roles held across pl_iter steps:
+  //   rbx = state_ptr        r12 = row_cap (capped at PL_MAX_ROWS)
+  //   r13 = idx              r14 = out_idx
+  //   r15 = rows_ptr         (base for task_rows[] stores)
+  //
+  // Labels prefixed pl_; substring "loop" avoided per encoder-reserved-
+  // keyword discipline (used `_iter_` / `_scan_` instead).
+  // ==========================================================================
+  pub let poll_tick : (u64) -> u64 !{mem, sysreg} @{} =
+    fn (state_ptr: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-top.M1-001 (postui-top#1): fixed-interval task-info refresh entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=row_cap capped at PL_MAX_ROWS=64, r13=idx, r14=out_idx, r15=rows_ptr) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + POLL_OFF_LAST_POLL_TICK=32]; sub rax, rcx (elapsed_ticks; unsigned wrap OK because last_poll_tick <= now_tick always -- monotonic clock); mov rcx, [rbx + POLL_OFF_POLL_INTERVAL_TICKS=24]; cmp rax, rcx; jb pl_notyet (below = not enough elapsed). On elapsed path save now_tick via another pl_sys_clock_ns re-read (simpler than saving rax across the sub) so `last_poll_tick` gets the current monotonic snapshot at commit time; the re-read cost is one syscall per successful refresh (<= once per interval), negligible. Actually optimized: keep the original now_tick in r15 slot temporarily by pushing/popping around the subtract -- or simpler, RE-COMPUTE now_tick by pl_sys_clock_ns() >> shift AFTER the iterate step (a poll_tick refresh takes N syscalls of jitter anyway, so anchoring last_poll_tick to the post-iterate tick is more honest for the next-interval computation -- see body). Phase B (row_cap clamp): mov r12, [rbx + POLL_OFF_TASK_ROW_CAP=16]; mov rax, PL_MAX_ROWS=64; cmp r12, rax; jbe pl_cap_ok; mov r12, rax; pl_cap_ok: (r12 = min(row_cap, 64)). Phase C (rows base): mov r15, [rbx + POLL_OFF_TASK_ROWS_PTR=0]. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (out_idx=0); pl_iter_step: cmp r13, r12; jae pl_iter_end; mov rdi, r13; lea rsi, [rip + _pl_scratch]; call pl_sys_taskinfo; cmp rax, 0; jne pl_iter_skip (any non-zero return = skip slot at M1-001; -ESRCH-stops-iteration is M1-002 refinement). Then transcode: (a) pid: mov rax, [rip + _pl_scratch + 0]; shl rax, 32; shr rax, 32 (zext-low32); compute dst = r15 + r14*48 (via lea + shl+add: mov rcx, r14; shl rcx, 5 (=*32); mov rdx, r14; shl rdx, 4 (=*16); add rcx, rdx (=*48); lea rdx, [r15 + rcx]); mov [rdx + 0], rax. (b) state: mov rax, [rip + _pl_scratch + 8]; shl rax, 32; shr rax, 32; mov [rdx + 8], rax. (c) ticks_cpu: mov rax, [rip + _pl_scratch + 32]; mov [rdx + 16], rax. (d) mem_kb: mov rax, [rip + _pl_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov [rdx + 24], rax. (e) name copy + name_ptr: mov rcx, r14; shl rcx, 4 (=*16); lea rax, [rip + _pl_names]; add rax, rcx (name_slot_ptr); mov rcx, [rip + _pl_scratch + 16]; mov [rax + 0], rcx (first 8B of name); mov rcx, [rip + _pl_scratch + 24]; mov [rax + 8], rcx (second 8B); mov [rdx + 32], rax (name_ptr). (f) name_len via strnlen: xor rcx, rcx; pl_nlen_scan: cmp rcx, 16; jae pl_nlen_end; xor r8, r8; mov_b r8b, [rax + rcx]; cmp r8, 0; je pl_nlen_end; add rcx, 1; jmp pl_nlen_scan; pl_nlen_end: mov [rdx + 40], rcx (name_len 0..16). out_idx += 1: add r14, 1. pl_iter_skip: add r13, 1; jmp pl_iter_step. pl_iter_end: mov [rbx + POLL_OFF_TASK_ROW_COUNT=8], r14. Phase E (commit tick): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24; mov [rbx + POLL_OFF_LAST_POLL_TICK=32], rax. Phase F (return 1): mov rax, 1; 5-pop; ret. pl_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (row-stride multiplication uses shl+add: 48 = 32+16 = shl 5 + shl 4 + add); no `and reg, imm64` (zero-extend low-32 uses shl 32 + shr 32 rather than and rax, 0xFFFFFFFF which would need imm64 staging); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic; every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 4, 5, 16, 24, 32, 64). Byte load uses `xor r8, r8; mov_b r8b, [mem]` per the byte-load-zero-then-mov_b compliance flag. Labels prefixed pl_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pl_sys_clock_ns / pl_sys_taskinfo) are all leaf syscall wrappers per the two `pub let`s above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        mov rbx, rdi;                              // rbx = state_ptr
+
+        // ---- Phase A: interval gate ----------------------------------------
+        // now_tick = pl_sys_clock_ns() >> PL_TICK_SHIFT
+        call pl_sys_clock_ns;
+        shr rax, 24;                               // rax = now_tick
+        // elapsed = now_tick - last_poll_tick
+        mov rcx, [rbx + 32];                       // rcx = last_poll_tick
+        sub rax, rcx;                              // rax = elapsed_ticks
+        // if elapsed < interval: return 0
+        mov rcx, [rbx + 24];                       // rcx = poll_interval_ticks
+        cmp rax, rcx;
+        jb pl_notyet;
+
+        // ---- Phase B: row_cap clamp ----------------------------------------
+        mov r12, [rbx + 16];                       // r12 = task_row_cap
+        mov rax, 64;                               // PL_MAX_ROWS
+        cmp r12, rax;
+        jbe pl_cap_ok;
+        mov r12, rax;                              // clamp
+        pl_cap_ok:
+
+        // ---- Phase C: rows base --------------------------------------------
+        mov r15, [rbx + 0];                        // r15 = task_rows_ptr
+
+        // ---- Phase D: iterate slots ----------------------------------------
+        xor r13, r13;                              // idx = 0
+        xor r14, r14;                              // out_idx = 0
+
+        pl_iter_step:
+        cmp r13, r12;
+        jae pl_iter_end;
+
+        // pl_sys_taskinfo(idx, &_pl_scratch)
+        mov rdi, r13;                              // idx
+        lea rsi, [rip + _pl_scratch];              // dst = _pl_scratch
+        call pl_sys_taskinfo;
+        cmp rax, 0;
+        jne pl_iter_skip;                          // non-zero -> skip slot
+
+        // ---- Transcode _pl_scratch -> task_rows[out_idx * 48] ----
+        // Compute dst = r15 + out_idx * 48  (48 = 32 + 16 = shl5 + shl4)
+        mov rcx, r14;
+        shl rcx, 5;                                // rcx = out_idx * 32
+        mov rdx, r14;
+        shl rdx, 4;                                // rdx = out_idx * 16
+        add rcx, rdx;                              // rcx = out_idx * 48
+        lea rdx, [r15 + rcx];                      // rdx = task_row dst base
+
+        // (a) pid: zero-extend low-32 of scratch[+0..+4]
+        mov rax, [rip + _pl_scratch + 0];
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdx + 0], rax;
+
+        // (b) state: zero-extend low-32 of scratch[+8..+12]
+        mov rax, [rip + _pl_scratch + 8];
+        shl rax, 32;
+        shr rax, 32;
+        mov [rdx + 8], rax;
+
+        // (c) ticks_cpu: qword from scratch[+32..+40]
+        mov rax, [rip + _pl_scratch + 32];
+        mov [rdx + 16], rax;
+
+        // (d) mem_kb: rss_pages << 2 (4KiB pages -> KiB)
+        mov rax, [rip + _pl_scratch + 40];
+        shl rax, 2;
+        mov [rdx + 24], rax;
+
+        // (e) name copy + name_ptr: dst_slot = _pl_names + out_idx * 16
+        mov rcx, r14;
+        shl rcx, 4;
+        lea rax, [rip + _pl_names];
+        add rax, rcx;                              // rax = name_slot_ptr
+        // Copy 16 bytes from _pl_scratch+16 into the name slot.
+        mov rcx, [rip + _pl_scratch + 16];
+        mov [rax + 0], rcx;
+        mov rcx, [rip + _pl_scratch + 24];
+        mov [rax + 8], rcx;
+        mov [rdx + 32], rax;                       // name_ptr
+
+        // (f) name_len via strnlen(name_slot, 16)
+        xor rcx, rcx;                              // rcx = i
+        pl_nlen_scan:
+        cmp rcx, 16;
+        jae pl_nlen_end;
+        xor r8, r8;
+        mov_b r8b, [rax + rcx];
+        cmp r8, 0;
+        je pl_nlen_end;
+        add rcx, 1;
+        jmp pl_nlen_scan;
+        pl_nlen_end:
+        mov [rdx + 40], rcx;                       // name_len
+
+        // out_idx += 1
+        add r14, 1;
+
+        pl_iter_skip:
+        add r13, 1;
+        jmp pl_iter_step;
+
+        pl_iter_end:
+        // task_row_count = out_idx
+        mov [rbx + 8], r14;
+
+        // ---- Phase E: commit tick ------------------------------------------
+        // Re-read the clock to anchor last_poll_tick at commit time (post-
+        // iterate jitter absorbed into the interval accounting -- see
+        // §justification for the rationale).
+        call pl_sys_clock_ns;
+        shr rax, 24;
+        mov [rbx + 32], rax;                       // last_poll_tick
+
+        // ---- Phase F: return 1 --------------------------------------------
+        mov rax, 1;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        pl_notyet:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}

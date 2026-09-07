@@ -1,0 +1,101 @@
+# postui-top — paideia-as build manifest
+#
+# Wave: postui v1 reference apps
+# Milestone: M1 (scaffold + sys_taskinfo poll loop)
+# Doc: paideia-os/postui/docs/design.md §3.1 (widget mix / data source /
+#      milestone breakdown for /bin/top) — authoritative; this repo's
+#      own STATUS.md is the rollup.
+#
+# postui-top is a userspace TOOL binary (a top(1)-style task viewer)
+# built on top of the postui widget library. Unlike postui itself
+# (kind = library, no _start), postui-top is a program a user launches
+# via `top` at the shell prompt — kind = tool, one _start, one output
+# ELF.
+#
+# ---------------------------------------------------------------------
+# M1-001 landing (paideia-os/postui-top#1)
+# ---------------------------------------------------------------------
+#
+# Scope: app scaffold + fixed-tick sys_taskinfo (sysno 83) poll loop
+# populating in-memory task rows. Only src/poll.pdx lands; every other
+# source enumerated below is a milestone forward-declaration and will
+# have a `sources:` entry added as its landing round writes it. The
+# per-file `paideia-as build --emit elf64` step in tools/build.sh
+# compiles every listed source into a loose ELF64 object under
+# build-out/; the final link into build-out/postui-top is a
+# downstream packaging step that lands with M1-005 (_start + main
+# loop bind) — until then this manifest describes a growing loose-
+# object set, not a linkable binary.
+#
+# This mirrors the shape postui/manifest.pdxproj established for the
+# same monorepo-satellite pattern.
+
+name        = postui-top
+version     = 0.1.0-pre
+kind        = tool
+# entry lands at M1-005 (_start binder + main render loop). At M1-001
+# there is no _start; the loose-object build via tools/build.sh
+# succeeds per-file but the downstream link step is DEFERRED. Named
+# here as a forward declaration so the M1-005 landing does not need
+# to churn this manifest.
+entry       = Main::main                    # DEFERRED until M1-005; see design/milestones.md
+output      = build-out/postui-top
+caps_decl   = caps.decl
+
+# --- Source list (order-insensitive; paideia-as resolves module deps
+# from `module <Basename> = structure { ... }` headers). Every file
+# listed below is compiled into build-out/<basename>.o by
+# tools/build.sh. M1-001 seeds only src/poll.pdx; the M1-002..M4-004
+# landings each add their own source entry as the module body lands.
+sources:
+  - src/poll.pdx                  # M1-001 (this issue): PollState + poll_init + poll_tick sys_taskinfo consumer
+
+# --- Library dependencies -----------------------------------------------
+# postui (the widget library at ../postui, v1.0.0 shipped at
+# postui-v1.0.0) is the primary dependency; M2 onward will link its
+# object set into the postui-top ELF. At M1-001 postui-top's poll
+# module is pure userspace with a sys_taskinfo syscall and no widget
+# calls yet — the dependency is declared here so the M1-005 render
+# landing does not have to introduce it.
+deps:
+  - postui @ ^0.1                 # M2-001: Table + Gauge widget consumers land here
+
+# --- Test targets ------------------------------------------------------
+# Populated starting M1-004 (poll_tick fingerprint test — deterministic
+# scratch snapshot + row-count invariant). Every entry below becomes a
+# `paideia-as build --tests` target once the corresponding issue lands.
+# Fail-code family bands for postui-top per this repo's design plan
+# (see design/architecture.md when it lands at M1-002):
+#   test_poll_tick_fingerprint          0xFFFFECF0..0xFFFFECFF   (M1-004)
+tests:
+  # (empty at M1-001; M1-004 adds tests/test_poll_tick_fingerprint.pdx)
+
+# --- Documentation targets ---------------------------------------------
+# .pdxdoc file(s) shipped at M4 packaging time.
+docs:
+  # (empty at M1-001; M4-004 adds doc/postui-top.pdxdoc)
+
+# --- Paideia-as compliance flags ---------------------------------------
+# Same invariant set postui / shell / libpdx-* satellites observe. A
+# build under a non-conforming paideia-as revision refuses fast in
+# tools/build.sh's version-floor check.
+compliance:
+  - module-basename-pascal        # module <BasenamePascalCase>, no dir prefix
+  - no-test-mnemonic              # zero-check via cmp reg, 0
+  - cmp-imm32-only                # cmp reg, imm <= 0x7FFFFFFF; else stage via r11
+  - r11-scratch                   # r11 is not preserved across calls
+  - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
+  - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
+
+# --- Release policy (M4-004+) ------------------------------------------
+# Dual-signed release mirroring postui / shell shape. Populated at M4
+# closing; fields below are forward-declared so the M4-004 landing does
+# not need to introduce them.
+release:
+  signer_author: snunez+postui-top-author@paideia-os.dev
+  signer_root:   paideia-os-release-root@paideia-os.dev
+  mldsa_level:   65
+  ed25519:       required
+  mirror_target: pkgs.paideia-os
+  tarball:       postui-top-v1.0.0.tar.gz
+  manifest_kind: satellite-tool
