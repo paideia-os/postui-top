@@ -53,6 +53,7 @@ sources:
   - src/view_gauge.pdx            # M3-001: ViewGauge -- 2x BAR gauge (CPU + memory activity)
   - src/view_sparkline.pdx        # M3-001b: ViewSparkline -- 64-slot ring history
   - src/view_tabs.pdx             # M3-002: ViewTabs -- 3-tab [All|User|Kernel] view switch wired to postui Tabs
+  - src/semantic_emit.pdx         # M4-001: SemanticEmit -- TaskRow@0.1 semantic-pipe record emit via sys_semantic_send (sysno 115)
 
 # --- Library dependencies -----------------------------------------------
 # postui (the widget library at ../postui, v1.0.0 shipped at

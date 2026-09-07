@@ -102,10 +102,26 @@ requires:
 #                table.md row 83, paideia-os). Fills a 64-byte record
 #                per live task; poll_tick iterates idx = 0..row_cap and
 #                transcodes into the postui-top 48-byte task_row form.
+#   * sysno 115 — sys_semantic_send(schema_hash, rec_ptr, rec_len)
+#                              -> 0|-EAGAIN|-EINVAL|-EFAULT
+#                Enqueues one typed record into the global semantic-
+#                pipe ring (4KB, 16 slots x 256B). ABI documented in
+#                the postui-top#6 issue and programmed against in
+#                src/semantic_emit.pdx (M4-001 landing). The kernel
+#                dispatch body is NOT YET LIVE at paideia-os HEAD --
+#                every invocation returns -ENOSYS
+#                (0xFFFFFFFFFFFFFFDA) until postui-top#7 / M4-002
+#                lands src/kernel/core/syscall/handlers/
+#                sys_semantic_send.pdx and the sysno-115 dispatch
+#                wiring in src/kernel/core/syscall/dispatch.pdx.
+#                Enumerated here so downstream dependency-audit sees
+#                the transport for the declared TaskRow@0.1 output
+#                schema below.
 # ---------------------------------------------------------------------
 syscalls:
 - sys_clock_read_ns @ 66
 - sys_taskinfo      @ 83
+- sys_semantic_send @ 115
 
 # ---------------------------------------------------------------------
 # Declared output schemas

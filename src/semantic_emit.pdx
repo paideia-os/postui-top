@@ -1,0 +1,562 @@
+// src/semantic_emit.pdx -- postui-top.M4-001 (paideia-os/postui-top#6)
+//
+// SemanticEmit module: TaskRow@0.1 semantic-pipe record emission via
+// SC+ sys_semantic_send (sysno 115).
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1, postui/docs/design.md L832 M4-001)
+// =============================================================================
+//
+// M4-001 wires the userspace tail of postui-top's semantic-pipe
+// contract. Every completed poll_tick refresh (src/poll.pdx returning
+// 1) hands its filled task_rows buffer to semantic_emit_task_rows,
+// which repacks the first N rows into the frozen 56-byte TaskRow@0.1
+// wire shape and dispatches one sys_semantic_send call per record
+// under a fixed schema hash. Downstream consumers bound against the
+// same schema hash (via libpdx-semantic-pipe's future bind path)
+// decode records directly; consumers ignorant of the schema fall
+// through to the ANSI text layer per postui/docs/design.md §5.2
+// "three concurrent layers" (rendered text, typed schema records,
+// cap list).
+//
+// The M4-001 landing only ships the wiring; it does NOT wire itself
+// into poll_tick's success arm (that call-site edit is M4-002 per
+// postui/docs/design.md §M4-* breakdown). M4-001's compile-and-link
+// success is the deliverable: semantic_emit_task_rows is callable
+// from any client (the M4-002 poll_tick binder OR the M4-003 test
+// harness) once its object lands in build-out/semantic_emit.o.
+//
+// =============================================================================
+// SYSNO 115 -- NOT YET LIVE IN paideia-os
+// =============================================================================
+//
+// design/user/syscall-table.md's tight-packed low band ends at
+// sysno 114 (unused rows past there dropped to the 517/527 out-of-
+// band pattern). Sysno 115 is the next free slot and the natural
+// home for sys_semantic_send; the ABI documented in the postui-top#6
+// issue text (rdi = schema_hash, rsi = record_ptr, rdx = record_len
+// in [1, 240], returns 0 on success or -errno on failure, backed by
+// a 4KB / 16-slot / 256B-per-slot global ring) is what this module
+// programs against.
+//
+// AT THIS LANDING the paideia-os kernel dispatch table does NOT
+// route sysno 115 to any handler -- a boot at HEAD returns -ENOSYS
+// (0xFFFFFFFFFFFFFFDA, two's complement -38) from every invocation.
+// That is the intended M4-001 shape: the userspace-side scaffolding
+// lands FIRST so the paideia-os kernel landing (postui-top#7 /
+// M4-002, "sys_semantic_send kernel body + dispatch wiring") has a
+// concrete userspace caller to smoke-test against once both sides
+// are green. Callers of semantic_emit_task_rows at M4-001 must
+// treat -ENOSYS as an EXPECTED sentinel and not a bug; the sentinel
+// (SE_ERR_ENOSYS = 0xFFFFFFFFFFFFFFDA) is enumerated below.
+//
+// This mirrors the M1-001 → M1-002 landing rhythm poll.pdx established
+// (userspace wrapper for a documented ABI first; defensive gates and
+// kernel-side landings follow in the next milestone). A future
+// design/user/syscall-table.md row for sysno 115 will cite this
+// module as the sole in-tree consumer.
+//
+// =============================================================================
+// SCHEMA HASH PLACEHOLDER (M4-001)
+// =============================================================================
+//
+// postui/docs/design.md §5.2 (line 468) freezes the production
+// schema-hash policy: `{widget}_schema_hash() -> [u8; 32]` where the
+// 32-byte hash is BLAKE3 over the schema descriptor JSON. The
+// sys_semantic_send ABI documented in postui-top#6 collapses that
+// 32-byte hash to a single u64 for cheap ring-side comparison
+// (matching the 4KB / 16-slot / 256B-per-slot envelope constraint --
+// a 32-byte hash prefix would eat 12.5% of every slot).
+//
+// The u64 form is defined as the LOW-64-BITS of BLAKE3("TaskRow@0.1")
+// in little-endian order (`u64::from_le_bytes(blake3(name)[0..8])`),
+// matching the truncation rule libpdx-semantic-pipe M1 will land at
+// design/tooling/r49-r50-plan.md §M1. Computing that BLAKE3 in
+// paideia-as at compile time requires libpdx-blake3 which does not
+// land until postui M5 (postui/docs/design.md §M5 "semantic-pipe
+// conformance"); until then this module uses a documented PLACEHOLDER
+// value with an unmistakable mnemonic shape so no downstream consumer
+// mistakes it for the frozen production hash.
+//
+// PLACEHOLDER:
+//   TASK_ROW_SCHEMA_HASH = 0x7A5CD0CE00010001
+//                          |___|___||___||___|
+//                          |    |     |    +-- schema minor (0001 = 0.1 minor)
+//                          |    |     +------- schema major (0001 = 0.1 major)
+//                          |    +------------- 4-nibble family tag (D0CE ~ "DOCE"
+//                          |                   = doc/document = record-shape)
+//                          +------------------ 4-nibble kind tag (7A5C ~ "TASC"
+//                                              = task-shaped record; the closest
+//                                              hex-legal spelling of TASK, which
+//                                              contains K = non-hex)
+//
+// The placeholder is stable across every M4-001 caller so tests
+// asserting the-hash-that-was-sent can pin against this exact value.
+// The M5 crossover flips this ONE constant to the computed BLAKE3
+// truncation; no ABI or caller change (rdi is still a u64).
+//
+// Alternative computed-hash choice explored: sum-of-schema-field-bytes
+// per the postui-top#6 issue's suggested fallback. Rejected because
+// (a) the sum is trivially collidable with other schemas (e.g. any
+// schema with the same field-count + field-name letter distribution
+// hashes to the same value), and (b) a mnemonic placeholder is more
+// obviously a placeholder than a computed-but-collidable value that
+// looks correct at a glance. The M5 BLAKE3 replacement resolves both.
+//
+// =============================================================================
+// EMISSION STRATEGY (M4-001)
+// =============================================================================
+//
+// The 240-byte per-slot envelope can hold at most floor(240/56) = 4
+// TaskRow records in a single sys_semantic_send call OR a single
+// record with room to spare. Two families of strategy were considered:
+//
+//   (A) One-call-per-record, first-N rows       -- N syscalls / tick
+//   (B) One record per tick, rotating cursor    -- 1 syscall  / tick
+//
+// M4-001 lands (A) with N = min(count, SE_MAX_EMIT_PER_TICK = 4):
+//
+//   + Fixed record shape per call (exactly one TaskRow = 56 bytes),
+//     matching the schema hash's single-record semantics. A future
+//     TaskRowBatch@0.1 schema (postui-top#N) can lift this to array-
+//     shape emission without changing THIS schema's contract.
+//   + Zero cursor state -- the module is stateless besides its .bss
+//     scratch, and every M4-002+ caller (poll_tick binder OR the
+//     M4-003 test harness) gets the same deterministic top-4 view
+//     per call.
+//   + 4 syscalls / tick is well within the 16-slot ring capacity;
+//     even a burst of 4 emits fills only 25% of the ring, leaving
+//     headroom for concurrent producers.
+//   + Every ring slot carries one complete TaskRow, so a consumer
+//     dropping mid-record is impossible; back-pressure surfaces as
+//     an early -EAGAIN return from the second-or-later call rather
+//     than a partial record in the ring.
+//
+// Rejected (B) rationale:
+//   - Requires per-tick cursor storage (in PollState reserved region
+//     OR module-scoped .bss), a state-management surface M4-002+ has
+//     to touch on every schema-shape change.
+//   - A consumer observing the ring at any tick sees only 1/N of the
+//     top-N task set, defeating top(1)-style "current top-4 by CPU"
+//     semantics without cross-tick reassembly.
+//
+// SYSCALL COUNT PER TICK (M4-001):
+//
+//   - 1 refresh tick = N sys_semantic_send calls, N = min(count, 4)
+//   - Best case (0 live tasks):   0 syscalls
+//   - Steady state (>= 4 tasks):  4 syscalls
+//   - Ring-full early-out:        <= 4 syscalls, propagates -EAGAIN
+//
+// This budget lands well under the sysno 66 (sys_clock_read_ns) +
+// N * sysno 83 (sys_taskinfo) already issued by poll_tick per its
+// own refresh (up to 64 taskinfo calls at PL_MAX_ROWS), so M4-001's
+// syscall overhead is < 7% of a full poll_tick refresh at cap.
+//
+// =============================================================================
+// TaskRow@0.1 WIRE LAYOUT (56 bytes, 7 u64 slots, fits 240B envelope)
+// =============================================================================
+//
+//   [+0]   pid         (u64)   from task_row[+0]  (POLL_ROW_OFF_PID)
+//   [+8]   state       (u64)   from task_row[+8]  (POLL_ROW_OFF_STATE)
+//   [+16]  ticks_cpu   (u64)   from task_row[+16] (POLL_ROW_OFF_TICKS_CPU)
+//   [+24]  mem_kb      (u64)   from task_row[+24] (POLL_ROW_OFF_MEM_KB)
+//   [+32]  name_ptr    (u64)   from task_row[+32] (POLL_ROW_OFF_NAME_PTR)
+//                              -- points into _pl_names, stable across
+//                                 poll_tick calls but the KERNEL RING
+//                                 stores the pointer bytes, not the
+//                                 target name bytes; downstream readers
+//                                 in a different aspace MUST NOT
+//                                 dereference (a subsequent postui-top-
+//                                 side "flatten name inline" record
+//                                 variant is TaskRowFlat@0.1 M5).
+//   [+40]  name_len    (u64)   from task_row[+40] (POLL_ROW_OFF_NAME_LEN)
+//   [+48]  reserved    (u64)   always 0 at M4-001; reserved for
+//                              start_tick (task_info.pdx +48 mirror)
+//                              or per-record status flags in a future
+//                              schema revision. Zeroed explicitly per
+//                              record to avoid _se_scratch carryover
+//                              from a prior iteration.
+//
+// The 56-byte size is chosen so 4 records fit inside one 240B ring
+// slot (4 * 56 = 224 <= 240) IF a future array-shape TaskRowBatch@0.1
+// schema wants to batch them; at M4-001 each record occupies its own
+// slot with 240 - 56 = 184 bytes of per-slot slack the ring's own
+// framing overhead (schema hash echo, length prefix) can spend.
+//
+// Postui-top's internal task_row (48B) diverges from TaskRow@0.1 only
+// in the reserved+8 slot; the 48-byte in-memory shape does NOT change
+// at M4-001 so poll.pdx and every M2 Table consumer keep reading it
+// unchanged.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE (matches poll.pdx discipline)
+// =============================================================================
+//
+//   - Module name PascalCase basename: file semantic_emit.pdx ->
+//     module SemanticEmit (module-basename-pascal invariant).
+//   - No `test` mnemonic; every zero-check via `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF).
+//   - Large sentinels (0xFFFFE00x band, 0x7A5CD0CE00010001 schema
+//     hash) only used as `mov reg, imm64` (movabs) source -- legal
+//     for mov but never for cmp/and per encoder pitfall log.
+//   - No 2-op `imul reg, imm`; row-stride multiplication uses
+//     `shl + add` (48 = 32+16 = shl 5 + shl 4 + add).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - r11 scratch discipline honored; syscall CPU-clobbers rcx/r11
+//     which are both SysV caller-save.
+//   - `pub let` single-line declarations only.
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `se_*` per the M4-001 issue fingerprint discipline. Substring
+//     "loop" avoided defensively (labels use `_iter_` / `_scan_`).
+//   - Every function that issues nested calls pushes an ODD count
+//     of 8-byte callee-save registers so `rsp % 16 == 0` at the
+//     call boundary (SysV entry rsp%16==8; +5 pushes = 40 bytes
+//     -> rsp%16 == 0).
+//   - Writes to _se_scratch go through a lea'd base register
+//     (matches poll.pdx's own `lea rax, [rip + _pl_names]; mov [rax
+//     + N], reg` idiom -- rip-relative stores exist encoding-wise
+//     but this repo's proven idiom is lea+register-store).
+//   - Byte load form (`xor r, r; mov_b r_b, [ptr]`) not exercised
+//     here (all repack loads are qword; nothing scans a NUL-terminated
+//     string).
+
+module SemanticEmit = structure {
+
+  // ==========================================================================
+  // Error band. postui-top's wave-scoped 0xFFFFE000..0xFFFFE00F band was
+  // opened by poll.pdx (see poll.pdx SECTION "Error band"). poll.pdx
+  // reserved +0..+3 (PL_ERR_BAD_STATE_PTR through PL_ERR_INTERVAL_ZERO)
+  // and left +4..+F for the M1-002+ growth. SemanticEmit claims +4..+7
+  // here, leaving +8..+F for M4-002+ (kernel-body-online defensive
+  // gates, ring-back-pressure aggregation) plus any late M1-002 or M2-
+  // M3 additions poll.pdx may still want.
+  //
+  // +4  SE_ERR_BAD_ROWS_PTR    semantic_emit_task_rows called with a
+  //                            null rows_ptr (M4-002 validation gate)
+  // +5  SE_ERR_COUNT_TOO_LARGE count > SE_MAX_EMIT_PER_TICK bypass gate
+  //                            (M4-002 validation, currently soft-clamped
+  //                            silently at M4-001 to match poll.pdx's
+  //                            row_cap clamp discipline)
+  // +6  SE_ERR_SCRATCH_UNMAPPED reserved -- future .bss mapping check
+  // +7  SE_ERR_EMIT_REFUSE      reserved -- future kernel-side aggregate
+  //
+  // At M4-001 semantic_emit_task_rows does NOT raise any SE_ERR_*
+  // sentinel -- it silently clamps count and skips zero-count calls
+  // (matching poll_tick's own defensive-gate deferral to M4-002). The
+  // sentinels are reserved here so the M4-002 gate landing does not
+  // need to introduce them.
+  // ==========================================================================
+  // POSTUI_TOP_OK is DELIBERATELY not re-declared here; poll.pdx owns
+  // the wave-shared symbol (`Poll::POSTUI_TOP_OK = 0`) and paideia-as
+  // strips the module qualifier at ELF-symbol emit (see poll.pdx §MODULE
+  // NAME DEVIATION), so a duplicate `pub let POSTUI_TOP_OK` here would
+  // ld-error at link time under multiple-definition rules. Callers that
+  // want the OK sentinel by name reach through Poll::POSTUI_TOP_OK; the
+  // typical caller pattern is `cmp rax, 0` (zero-value literal) rather
+  // than the symbol.
+  pub let SE_ERR_BAD_ROWS_PTR        : u64 = 0xFFFFE004
+  pub let SE_ERR_COUNT_TOO_LARGE     : u64 = 0xFFFFE005
+  pub let SE_ERR_SCRATCH_UNMAPPED    : u64 = 0xFFFFE006
+  pub let SE_ERR_EMIT_REFUSE         : u64 = 0xFFFFE007
+
+  // ==========================================================================
+  // Kernel-side sys_semantic_send error sentinels (documented ABI per
+  // postui-top#6). The u64 values are the two's-complement encoding of
+  // the negative errno the kernel returns via rax.
+  //
+  // SE_ERR_ENOSYS is the EXPECTED return at M4-001 until the paideia-os
+  // sysno-115 dispatch landing (postui-top#7 / M4-002 cross-repo);
+  // callers must treat it as a "kernel not yet ready" signal rather
+  // than a bug. Every other sentinel becomes reachable once the kernel
+  // body lands.
+  // ==========================================================================
+  pub let SE_ERR_ENOSYS  : u64 = 0xFFFFFFFFFFFFFFDA   // -38, sysno 115 unrouted
+  pub let SE_ERR_EAGAIN  : u64 = 0xFFFFFFFFFFFFFFF5   // -11, ring full
+  pub let SE_ERR_EINVAL  : u64 = 0xFFFFFFFFFFFFFFEA   // -22, rec_len out of [1,240]
+  pub let SE_ERR_EFAULT  : u64 = 0xFFFFFFFFFFFFFFF2   // -14, bad rec_ptr
+
+  // ==========================================================================
+  // TaskRow@0.1 wire layout constants. Every offset is imm8, every
+  // total is imm8; the whole shape fits inside the 240B ring envelope
+  // with 184B slack.
+  // ==========================================================================
+  pub let SE_TASK_ROW_BYTES         : u64 = 56
+
+  pub let SE_TR_OFF_PID             : u64 = 0
+  pub let SE_TR_OFF_STATE           : u64 = 8
+  pub let SE_TR_OFF_TICKS_CPU       : u64 = 16
+  pub let SE_TR_OFF_MEM_KB          : u64 = 24
+  pub let SE_TR_OFF_NAME_PTR        : u64 = 32
+  pub let SE_TR_OFF_NAME_LEN        : u64 = 40
+  pub let SE_TR_OFF_RESERVED        : u64 = 48
+
+  // ==========================================================================
+  // Source-side task_row layout (mirrors poll.pdx POLL_ROW_OFF_* --
+  // named locally so the repack loop below cites offsets without a
+  // cross-module `use` clause paideia-as's per-file compile does not
+  // support at M1). Kept byte-identical with poll.pdx; a drift would
+  // scramble the emitted records.
+  // ==========================================================================
+  pub let SE_SRC_ROW_BYTES          : u64 = 48
+
+  pub let SE_SRC_OFF_PID            : u64 = 0
+  pub let SE_SRC_OFF_STATE          : u64 = 8
+  pub let SE_SRC_OFF_TICKS_CPU      : u64 = 16
+  pub let SE_SRC_OFF_MEM_KB         : u64 = 24
+  pub let SE_SRC_OFF_NAME_PTR       : u64 = 32
+  pub let SE_SRC_OFF_NAME_LEN       : u64 = 40
+
+  // ==========================================================================
+  // Emission-cap constant (see §EMISSION STRATEGY -- (A) one-call-per-
+  // record, N = min(count, 4)). Kept small enough that even a burst
+  // never approaches the 16-slot ring capacity.
+  // ==========================================================================
+  pub let SE_MAX_EMIT_PER_TICK      : u64 = 4
+
+  // ==========================================================================
+  // Ring envelope size (kernel-side sys_semantic_send ABI, per
+  // postui-top#6). Named locally so the length-argument literal (56)
+  // is documented against its ceiling and a future SE_TASK_ROW_BYTES
+  // enlargement past 240 trips a compile-time review of this file.
+  // ==========================================================================
+  pub let SE_RING_SLOT_BYTES        : u64 = 240
+
+  // ==========================================================================
+  // Schema hash placeholder (see §SCHEMA HASH PLACEHOLDER). Every
+  // sys_semantic_send call in this module passes this exact value
+  // via rdi. Downstream tests pin against this exact literal; the
+  // M5 BLAKE3 crossover flips this ONE constant.
+  // ==========================================================================
+  pub let TASK_ROW_SCHEMA_HASH      : u64 = 0x7A5CD0CE00010001
+
+  // ==========================================================================
+  // SC+ sysno (design/user/syscall-table.md -- future row 115 pending
+  // the kernel-side landing). Named locally so the syscall wrapper
+  // below cites the sysno in one place, matching poll.pdx's own
+  // PL_SYS_* discipline.
+  // ==========================================================================
+  pub let SE_SYS_SEMANTIC_SEND      : u64 = 115
+
+  // ==========================================================================
+  // Scratch buffer. Sized at exactly SE_TASK_ROW_BYTES = 56 bytes; one
+  // TaskRow record at a time is repacked here then handed to the
+  // kernel via rsi. Lives in .bss (zero-initialized at load); the
+  // repack loop overwrites every byte per iteration so pre-existing
+  // content never leaks into the ring.
+  //
+  // @align(8) so the qword stores below never split a cache line;
+  // one 56-byte record fits inside one L1D line (64B) with 8B slack.
+  // ==========================================================================
+  pub let mut _se_scratch : [u8; 56] = uninit @align(8)
+
+  // ==========================================================================
+  // se_sys_semantic_send(schema_hash, rec_ptr, rec_len) -> u64
+  //
+  // Thin wrapper around SC+ sysno 115 (sys_semantic_send). Mirrors
+  // poll.pdx's pl_sys_taskinfo shape (SysV rdi/rsi/rdx pass through
+  // unchanged to SYSCALL rdi/rsi/rdx -- arity 3 < 4 so no arg
+  // shuffle).
+  //
+  // Contract (documented per postui-top#6, kernel body lands M4-002):
+  //   rdi = schema_hash    u64, the truncated schema fingerprint
+  //   rsi = rec_ptr        VA of a rec_len-byte record buffer
+  //   rdx = rec_len        length in bytes, MUST be in [1, 240]
+  //   -> rax = 0           success (record enqueued into ring)
+  //   -> rax = -ENOSYS     M4-001 shape (sysno 115 unrouted)
+  //   -> rax = -EAGAIN     ring full
+  //   -> rax = -EINVAL     rec_len out of [1, 240]
+  //   -> rax = -EFAULT     bad rec_ptr
+  //
+  // Effect row `!{mem, sysreg}` because the kernel reads rec_len
+  // bytes from the caller's rec_ptr into its ring. No capability
+  // (@{}) at M1 -- the M4-002+ policy (KIND_SEMANTIC_PIPE with
+  // R_EMIT rights) will land at the dispatch shim, not this
+  // userspace wrapper.
+  //
+  // Leaf: syscall clobbers rcx/r11 (both SysV caller-save).
+  // ==========================================================================
+  pub let se_sys_semantic_send : (u64, u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (schema_hash: u64) (rec_ptr: u64) (rec_len: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-top.M4-001 (postui-top#6): SC+ sysno 115 (sys_semantic_send) wrapper. SysV rdi=schema_hash / rsi=rec_ptr / rdx=rec_len pass through unchanged to SYSCALL rdi/rsi/rdx (arity 3, no shuffle). mov rax, 115; syscall; ret. Kernel body NOT YET LIVE at M4-001 -- paideia-os HEAD's dispatch table only routes sysno 0..114 (design/user/syscall-table.md tight low band) plus the out-of-band 517/527 rows; any invocation at HEAD returns -ENOSYS (0xFFFFFFFFFFFFFFDA) which propagates through this wrapper's rax verbatim. The M4-002 cross-repo landing (postui-top#7) adds the paideia-os body at src/kernel/core/syscall/handlers/sys_semantic_send.pdx wired against a global 4KB / 16-slot / 256B-per-slot ring; ABI documented in the postui-top#6 issue text is the frozen contract this wrapper programs against. Once live: returns 0 on success or one of -EAGAIN (0xFFFFFFFFFFFFFFF5, ring full), -EINVAL (0xFFFFFFFFFFFFFFEA, rec_len out of [1, 240]), -EFAULT (0xFFFFFFFFFFFFFFF2, bad rec_ptr). Leaf: rcx/r11 SYSCALL-clobbered (SysV caller-save). Sole in-module consumer: semantic_emit_task_rows' per-record emit call in the iterate loop. Encoder discipline: `mov rax, 115` fits imm8; no `test`; no imul; no `and reg, imm64`. Label-free (single straight-line body). Effects {mem, sysreg} @{} matches poll.pdx's pl_sys_taskinfo posture (same kernel-writes-user-buf-plus-syscall shape).",
+      block: {
+        mov rax, 115;
+        syscall;
+        ret
+      }
+    }
+
+  // ==========================================================================
+  // semantic_emit_task_rows(rows_ptr, count) -> u64
+  //
+  // Repack the first N = min(count, SE_MAX_EMIT_PER_TICK) task_rows at
+  // rows_ptr into TaskRow@0.1 wire form (56 bytes each) and dispatch
+  // one sys_semantic_send call per record under
+  // TASK_ROW_SCHEMA_HASH. Stops early on the first non-zero kernel
+  // return, propagating that value to the caller.
+  //
+  // Contract:
+  //   rdi = rows_ptr       VA of a count * 48-byte task_row buffer
+  //                        (typically PollState.task_rows_ptr, filled
+  //                        by the most recent poll_tick refresh)
+  //   rsi = count          number of populated task_rows (typically
+  //                        PollState.task_row_count); silently clamped
+  //                        at SE_MAX_EMIT_PER_TICK = 4
+  //   -> rax = 0           all N emits succeeded (may include N = 0
+  //                        when count = 0 -- zero-work fast path)
+  //   -> rax != 0          kernel error return from the FIRST failing
+  //                        emit; propagated verbatim. At M4-001 the
+  //                        typical value is -ENOSYS (0xFFFFFFFFFFFFFFDA)
+  //                        from the FIRST call; once the kernel body
+  //                        lands the shape becomes -EAGAIN when the
+  //                        ring back-pressures mid-batch or -EINVAL /
+  //                        -EFAULT for a malformed record (which
+  //                        should be caller-preventable).
+  //
+  // Algorithm:
+  //   1. rbx = rows_ptr; r12 = min(count, 4)   [count clamp]
+  //   2. Early return 0 if r12 == 0            [zero-work fast path]
+  //   3. r13 = 0                                [iterate index]
+  //   4. LOOP se_iter_step:
+  //      a. if r13 >= r12 -> jmp se_iter_end_ok
+  //      b. src = rows_ptr + r13 * 48           [row stride via shl+add]
+  //      c. Copy 6 u64s from src[+0..+40] into _se_scratch[+0..+40]
+  //      d. Zero _se_scratch[+48]                [reserved slot]
+  //      e. call se_sys_semantic_send(TASK_ROW_SCHEMA_HASH,
+  //                                    &_se_scratch, 56)
+  //      f. if rax != 0 -> jmp se_iter_end_err  [propagate + 5-pop]
+  //      g. r13 += 1; jmp se_iter_step
+  //   5. se_iter_end_ok:  rax = 0;  5-pop; ret
+  //   6. se_iter_end_err: (rax preserved);  5-pop; ret
+  //
+  // Register plan: 5-push callee-save prologue (rbx / r12 / r13 / r14
+  // / r15) = 40 bytes -> SysV entry rsp%16==8 + 40 = rsp%16 == 0 for
+  // every nested `call se_sys_semantic_send` inside the loop. Roles:
+  //   rbx = rows_ptr       r12 = capped_count (min(count, 4))
+  //   r13 = i               r14 = unused (reserved for a future
+  //                              per-record retry counter)
+  //   r15 = src (per-iteration; overwritten each step)
+  //
+  // The r14 slot is not exercised at M4-001 but is pushed anyway to
+  // keep the 5-push odd-count alignment discipline; the alternative
+  // (4 pushes + `sub rsp, 8` pad) works but the 5-push shape is what
+  // poll.pdx settled on and matching it costs nothing.
+  //
+  // Labels: se_cap_ok / se_iter_step / se_iter_end_ok / se_iter_end_err.
+  // Substring "loop" avoided defensively; every label prefixed se_.
+  // ==========================================================================
+  pub let semantic_emit_task_rows : (u64, u64) -> u64 !{mem, sysreg} @{} =
+    fn (rows_ptr: u64) (count: u64) -> unsafe {
+      effects: {mem, sysreg}, capabilities: {},
+      justification: "postui-top.M4-001 (postui-top#6): TaskRow@0.1 semantic-pipe record emitter. Contract SysV rdi=rows_ptr / rsi=count. Body clamps count at SE_MAX_EMIT_PER_TICK=4 (Phase B, matches poll_tick's own row_cap clamp discipline against PL_MAX_ROWS), then in a bounded loop repacks the source 48-byte task_row into the 56-byte TaskRow@0.1 wire shape in _se_scratch and calls se_sys_semantic_send under TASK_ROW_SCHEMA_HASH=0x7A5CD0CE00010001. First non-zero return propagates as rax and short-circuits the loop; success returns 0. Register plan: 5-push callee-save prologue (rbx=rows_ptr, r12=capped_count, r13=i, r14=reserved for future retry counter, r15=src per-iteration) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested `call se_sys_semantic_send`. Phase A (arg latch): mov rbx, rdi; mov r12, rsi. Phase B (count clamp): mov rax, SE_MAX_EMIT_PER_TICK=4; cmp r12, rax; jbe se_cap_ok; mov r12, rax; se_cap_ok:. Phase C (zero-count fast path): cmp r12, 0; je se_iter_end_ok. Phase D (iterate): xor r13, r13 (i=0); se_iter_step: cmp r13, r12; jae se_iter_end_ok. Compute src = rbx + i*48 via shl+add (48 = 32+16 = shl 5 + shl 4 + add, matching poll.pdx's identical stride computation): mov rcx, r13; shl rcx, 5; mov rdx, r13; shl rdx, 4; add rcx, rdx; lea r15, [rbx + rcx]. Repack src -> _se_scratch: lea r8, [rip + _se_scratch] (r8 is SysV caller-save, safe across the 6+1 store sequence -- no CALL yet); mov rax, [r15+0]; mov [r8+0], rax (pid); mov rax, [r15+8]; mov [r8+8], rax (state); mov rax, [r15+16]; mov [r8+16], rax (ticks_cpu); mov rax, [r15+24]; mov [r8+24], rax (mem_kb); mov rax, [r15+32]; mov [r8+32], rax (name_ptr); mov rax, [r15+40]; mov [r8+40], rax (name_len); xor rax, rax; mov [r8+48], rax (reserved zero). Call: mov rdi, 0x7A5CD0CE00010001 (schema_hash, movabs -- legal for mov, not for cmp/and); lea rsi, [rip + _se_scratch]; mov rdx, 56 (rec_len = SE_TASK_ROW_BYTES); call se_sys_semantic_send. Check: cmp rax, 0; jne se_iter_end_err (propagate first kernel error). Iterate: add r13, 1; jmp se_iter_step. Phase E (success return): se_iter_end_ok: xor rax, rax; 5-pop; ret. Phase F (error return): se_iter_end_err: (rax already holds the propagated kernel value); 5-pop; ret. Both epilogues run the identical 5-pop sequence in the LIFO order matching the prologue push order (poll.pdx same shape). Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (row-stride uses shl+add); no `and reg, imm64`; no `cmp reg, [mem]` (Phase D's iterate bound cmp r13, r12 is register-register); no `mul` mnemonic; every immediate in cmp/shr/shl fits imm8 (0, 4, 5, 16, 24, 32, 40, 48, 56). The single imm64 (0x7A5CD0CE00010001 schema hash) is `mov reg, imm64` movabs, legal for mov; every other constant is a `mov reg, imm8/imm32` fit. Store to _se_scratch goes through a lea'd base (r8) rather than a rip-relative store, matching poll.pdx's own `lea rax, [rip + _pl_names]; mov [rax + N], reg` idiom. Labels prefixed se_ (substring \"loop\" avoided; encoder-reserved keywords never appear). Cross-module call target (se_sys_semantic_send) is a leaf syscall wrapper per the `pub let` above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+
+        // ---- Phase A: arg latch --------------------------------------------
+        mov rbx, rdi;                              // rbx = rows_ptr
+        mov r12, rsi;                              // r12 = count
+
+        // ---- Phase B: count clamp ------------------------------------------
+        mov rax, 4;                                // SE_MAX_EMIT_PER_TICK
+        cmp r12, rax;
+        jbe se_cap_ok;
+        mov r12, rax;                              // clamp
+        se_cap_ok:
+
+        // ---- Phase C: zero-count fast path ---------------------------------
+        cmp r12, 0;
+        je se_iter_end_ok;
+
+        // ---- Phase D: iterate + repack + emit ------------------------------
+        xor r13, r13;                              // i = 0
+
+        se_iter_step:
+        cmp r13, r12;
+        jae se_iter_end_ok;
+
+        // src = rbx + i * 48  (48 = 32 + 16 = shl 5 + shl 4 + add)
+        mov rcx, r13;
+        shl rcx, 5;                                // rcx = i * 32
+        mov rdx, r13;
+        shl rdx, 4;                                // rdx = i * 16
+        add rcx, rdx;                              // rcx = i * 48
+        lea r15, [rbx + rcx];                      // r15 = src (task_row base)
+
+        // Repack src -> _se_scratch through a lea'd base (r8 caller-
+        // save; the immediately-following sequence has no nested CALL
+        // until every store is done, so r8 needs no preservation).
+        lea r8, [rip + _se_scratch];
+
+        // (a) pid
+        mov rax, [r15 + 0];
+        mov [r8 + 0], rax;
+
+        // (b) state
+        mov rax, [r15 + 8];
+        mov [r8 + 8], rax;
+
+        // (c) ticks_cpu
+        mov rax, [r15 + 16];
+        mov [r8 + 16], rax;
+
+        // (d) mem_kb
+        mov rax, [r15 + 24];
+        mov [r8 + 24], rax;
+
+        // (e) name_ptr
+        mov rax, [r15 + 32];
+        mov [r8 + 32], rax;
+
+        // (f) name_len
+        mov rax, [r15 + 40];
+        mov [r8 + 40], rax;
+
+        // (g) reserved = 0  (explicit zero -- prevents carryover from
+        //     a prior iteration or leftover .bss content leaking into
+        //     the ring, even though .bss loads zero once at startup)
+        xor rax, rax;
+        mov [r8 + 48], rax;
+
+        // ---- Emit: se_sys_semantic_send(schema_hash, &_se_scratch, 56) ----
+        // schema_hash literal is imm64 -- movabs is legal for `mov`
+        // even though not for cmp/and (encoder pitfall log).
+        mov rdi, 0x7A5CD0CE00010001;               // TASK_ROW_SCHEMA_HASH
+        lea rsi, [rip + _se_scratch];              // rec_ptr
+        mov rdx, 56;                               // rec_len = SE_TASK_ROW_BYTES
+        call se_sys_semantic_send;
+
+        // Propagate first non-zero kernel return
+        cmp rax, 0;
+        jne se_iter_end_err;
+
+        add r13, 1;
+        jmp se_iter_step;
+
+        // ---- Phase E: success return ---------------------------------------
+        se_iter_end_ok:
+        xor rax, rax;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+
+        // ---- Phase F: error return (rax preserved from kernel) -------------
+        se_iter_end_err:
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret
+      }
+    }
+
+}
