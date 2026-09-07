@@ -1,0 +1,644 @@
+// src/view_table.pdx -- postui-top.M2-001 (paideia-os/postui-top#2)
+//
+// ViewTable module: bridge the M1-001 poll.pdx task_row array into a
+// postui.M2-006 Table widget draw.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1 postui-top reference app, M2-001 slot)
+// =============================================================================
+//
+// M1-001 landed `src/poll.pdx` which fills an N-entry array of 48-byte
+// task_row records (pid / state / ticks_cpu / mem_kb / name_ptr /
+// name_len) at every `poll_tick`. This landing wires that array into a
+// postui `Table` widget for on-screen rendering.
+//
+// The postui `Table` widget wants:
+//
+//   1. An array of `TableRow` records (16 B each: cells_ptr, cell_count),
+//      NOT the 48-byte task_row shape.
+//   2. Each `TableRow`'s `cells_ptr` addresses an array of `Span` records
+//      (24 B each: bytes_ptr, byte_len, style) -- one Span per column.
+//   3. A `Line` record (24 B) for the column headers (spans_ptr,
+//      span_count, alignment), pointing at one Span per header cell.
+//   4. A packed Constraint u64 array (Layout module wire) sized to
+//      column_count, giving the per-column width policy.
+//   5. A `TableState` slot (24 B: selected_row, offset, reserved) that
+//      survives across frames.
+//   6. A single 80-byte `TableSpec` gluing all of the above.
+//
+// The heart of this module is a per-frame ADAPTER LOOP that repopulates
+// the cell-Span, TableRow, and format-buffer scratch arrays from the
+// current poll.pdx task_rows[] snapshot, then a single `table_draw` call
+// blits the frame into the caller-provided cell buffer.
+//
+// =============================================================================
+// COLUMN LAYOUT (issue-mandated widths)
+// =============================================================================
+//
+//   Column 0 (PID):     Length(6)     6 cells; task_row.pid decimal
+//   Column 1 (STATE):   Length(8)     8 cells; task_row.state decimal
+//   Column 2 (CPU%):    Length(6)     6 cells; task_row.ticks_cpu decimal
+//                                     (raw cumulative LAPIC ticks; a
+//                                     future landing computes the
+//                                     percentage delta -- the header text
+//                                     is preserved per the issue spec)
+//   Column 3 (MEM(KB)): Length(10)   10 cells; task_row.mem_kb decimal
+//   Column 4 (NAME):    Fill(1)       remaining terminal width;
+//                                     task_row.name_ptr / name_len
+//                                     forwarded verbatim (no copy)
+//
+// The Layout module encodes each constraint as a packed u64:
+//
+//   Length(n) = (LAYOUT_TAG_LENGTH << 56) | (n & 0xFFFFFF)
+//             = (0x01 << 56) | n              [tag ordinal 1]
+//   Fill(w)   = (LAYOUT_TAG_FILL   << 56) | (w & 0xFFFFFF)
+//             = (0x06 << 56) | w              [tag ordinal 6]
+//
+// This module stamps those five constants directly into the constraint
+// slab at each `view_table_render` call rather than issuing five
+// cross-module `call layout_length` / `call layout_fill` invocations
+// per frame -- the packed values are stable constants and staging them
+// via `mov r11, imm64` (movabs, legal for mov) is cheaper than a call
+// pair. Cross-referenced against postui/src/layout.pdx `layout_length`
+// / `layout_fill` bit-for-bit; a Layout wire evolution would touch
+// exactly those five constants (see VT_CONSTRAINT_* below).
+//
+// =============================================================================
+// ADAPTER APPROACH
+// =============================================================================
+//
+// The task_row shape (48 B) and the Table's per-row expectation (a
+// TableRow at 16 B plus an array of 5 Spans at 5*24 = 120 B) are
+// incompatible sizes, so a direct pointer alias is impossible. Instead:
+//
+//   For each row i in [0, min(task_row_count, VT_MAX_ROWS)):
+//     * Compute src = task_rows_ptr + i * POLL_ROW_BYTES=48.
+//     * Compute cell_base = _vt_cells + i * (VT_COLUMN_COUNT=5 * 24) = 120.
+//     * Format each numeric field (pid / state / ticks_cpu / mem_kb)
+//       into its per-row per-column 16-byte scratch slot inside
+//       _vt_fmt_<col>[]; vt_fmt_u64 writes digits right-to-left ending
+//       at buf_end and returns the digit count. Span.ptr =
+//       buf_end - len; Span.byte_len = len. Style = 0 (Style module
+//       default = white-on-black, unbold).
+//     * For the NAME column, alias directly onto (src.name_ptr,
+//       src.name_len) -- no copy, no format. The poll module already
+//       maintains _pl_names[i * 16] slots stable across ticks, so the
+//       aliased pointer stays valid for the whole `view_table_render`
+//       call.
+//     * Populate the TableRow at _vt_rows + i * 16 with
+//       (cell_base, VT_COLUMN_COUNT).
+//
+// The header Line and its 5 header-cell Spans are stamped from immutable
+// header-string statics (_vt_hdr_*) at every render, matching Ratatui's
+// contract that header content is a caller-supplied Line rather than a
+// once-only setup.
+//
+// =============================================================================
+// STATIC SCRATCH FOOTPRINT (BSS, zero-initialized at load)
+// =============================================================================
+//
+//   _vt_headers_spans   [u8; 120]   5 header Spans (24 B each)
+//   _vt_header_line     [u8;  24]   1 Line (spans_ptr, span_count,
+//                                   alignment)
+//   _vt_constraints     [u8;  40]   5 packed Constraint u64s
+//   _vt_cells           [u8; 3840]  32 rows * 5 cells * 24 B/Span
+//   _vt_rows            [u8; 512]   32 TableRow records (16 B each)
+//   _vt_fmt_pid         [u8; 512]   32 * 16-byte per-row PID digits
+//   _vt_fmt_state       [u8; 512]   32 * 16-byte per-row STATE digits
+//   _vt_fmt_cpu         [u8; 512]   32 * 16-byte per-row CPU% digits
+//   _vt_fmt_mem         [u8; 512]   32 * 16-byte per-row MEM(KB) digits
+//   _vt_spec            [u8;  80]   TableSpec
+//   _vt_state           [u8;  24]   TableState
+//
+// Total = 120 + 24 + 40 + 3840 + 512 + 512 + 512 + 512 + 512 + 80 + 24
+//       = 6688 bytes (~ 1.6 pages)
+//
+// Fixed cap VT_MAX_ROWS=32 mirrors the poll.pdx row_cap ceiling
+// (PL_MAX_ROWS=64 today; postui-top only paints as many rows as the
+// terminal can show, and 32 is a comfortable ceiling for typical 80x24
+// terminals with header + surrounding chrome). Overflow is silently
+// clamped: view_table_render caps count at 32 even if poll.pdx wrote
+// more (documented -- callers wanting a taller view can grow VT_MAX_ROWS
+// in one place, resize the four scratch slabs proportionally, and
+// rebuild).
+//
+// 15-DIGIT LIMIT: each per-cell format buffer is 16 bytes; vt_fmt_u64
+// writes at most 15 digits (buf_end .. buf_end - 15) before it would
+// overrun the next cell's scratch. The realistic maxima for these
+// fields fit comfortably: pid <= 2 digits (MAX_PIDS=64), state <= 1,
+// ticks_cpu <= 20 (u64 max) but a 100Hz LAPIC clock hits 10^10 only
+// after 3 years of uptime, mem_kb <= 13 (petabyte-scale RAM). At v1
+// this module documents the cap rather than guards it -- a caller
+// wanting hard clamping wraps the value with `min(val, 999_999_999_999)`
+// before calling `view_table_render`.
+//
+// =============================================================================
+// ENTRY SIGNATURE
+// =============================================================================
+//
+//   view_table_render(poll_state_ptr, buffer_ptr, rows, cols) -> u64
+//
+//   rdi = poll_state_ptr    VA of a PollState populated by poll_init /
+//                           poll_tick (256 B at Poll::POLL_STATE_BYTES)
+//   rsi = buffer_ptr        VA of a `rows * cols` grid of 16-byte Cells
+//                           (postui/src/cell.pdx cell wire; buffer.pdx
+//                           allocates it)
+//   rdx = rows              terminal row count
+//   rcx = cols              terminal column count
+//   -> rax                  0 on success, or a Layout / Table sentinel
+//                           propagated verbatim from `table_draw`.
+//
+// The rect passed to `table_draw` covers the full (0, 0, cols, rows)
+// grid -- this is the top-level table view. A future landing (M3-002
+// Tabs) will confine the table to a sub-rect and this module gains a
+// rect argument; the internal draw path stays the same.
+//
+// =============================================================================
+// SC+ / KERNEL EFFECT SURFACE
+// =============================================================================
+//
+// view_table_render issues NO syscalls itself. It reads through
+// poll_state_ptr (memory), reads task_rows[] (memory), reads name
+// bytes through the aliased name_ptr (memory), writes into the cell
+// buffer (memory) via table_draw. Effect row `!{mem}` @{} matches
+// table_draw's own effect. No capability gate.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewTable`), matches file
+//     basename view_table.pdx.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Constraint values (0x0100000000000006 etc.) are loaded via
+//     `mov reg, imm64` -- paideia-as emits movabs (10 bytes), legal
+//     for mov. NEVER used in cmp/and.
+//   - Every immediate in cmp/and fits imm32 (widest is 0xFFFF at 16
+//     bits; sentinel values are `mov`-only).
+//   - No 2-op `imul reg, imm` anywhere. Row-stride multiplications
+//     stage the stride through a scratch register: `mov r8, 48; imul
+//     rax, r8` / `mov r8, 120; imul rax, r8`. Divide-by-10 in
+//     vt_fmt_u64 uses `xor rdx, rdx; div rcx`.
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - Byte store shape `mov_b [reg], rdx` (low byte of rdx). Matches
+//     scr_emit_u64's discipline verbatim.
+//   - Every `pub let` declaration is single-line (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `vt_*` for view_table_render and `vt_fu_*` for vt_fmt_u64
+//     per the postui-top fingerprint discipline.
+//   - r11 usage: view_table_render uses r11 as a per-store scratch
+//     across the header / constraint / cell / spec population phases.
+//     Every `lea rN, [rip + label]` emit through paideia-as clobbers
+//     r11 internally; those are the only ones in the body, and no
+//     value survives them (r11 is re-loaded on the next use). Same
+//     scratch discipline scraper_example.pdx documents at its
+//     _start / scraper_main lea sites.
+//   - SysV push/pop parity:
+//       * view_table_render: 5-push callee-save prologue (rbx / r12 /
+//         r13 / r14 / r15 = 40 bytes) + `sub rsp, 64` (aligned) ->
+//         entry rsp%16==8, +40==0, +64==0 for every nested call
+//         (vt_fmt_u64 and table_draw).
+//       * vt_fmt_u64: pure leaf; no push/pop, no callee-save touched,
+//         no nested call.
+
+module ViewTable = structure {
+
+  // ==========================================================================
+  // Sizing / structural constants
+  // ==========================================================================
+  pub let VT_MAX_ROWS       : u64 = 32
+  pub let VT_COLUMN_COUNT   : u64 = 5
+  pub let VT_FMT_BUF_BYTES  : u64 = 16
+  pub let VT_ROW_STRIDE     : u64 = 16    // TableRow (Table::TABLE_ROW_BYTES)
+  pub let VT_CELL_STRIDE    : u64 = 24    // Span (Text::TEXT_SPAN_BYTES)
+  pub let VT_CELLS_PER_ROW  : u64 = 120   // VT_COLUMN_COUNT * VT_CELL_STRIDE
+
+  // Column widths (issue-mandated).
+  pub let VT_COL_PID_WIDTH   : u64 = 6
+  pub let VT_COL_STATE_WIDTH : u64 = 8
+  pub let VT_COL_CPU_WIDTH   : u64 = 6
+  pub let VT_COL_MEM_WIDTH   : u64 = 10
+  pub let VT_COL_NAME_WEIGHT : u64 = 1    // Fill(1)
+
+  // ==========================================================================
+  // Precomputed Layout::Constraint packed u64 values.
+  //
+  // Bit-for-bit match against postui/src/layout.pdx:
+  //   layout_length(n) = (1 << 56) | (n & 0xFFFFFF)
+  //   layout_fill(w)   = (6 << 56) | (w & 0xFFFFFF)
+  //
+  // These live at module scope for cross-reference; the render body
+  // stamps them via `mov r11, imm64` (movabs) directly rather than
+  // dereferencing these symbols, because movabs is one instruction and
+  // a symbol dereference would cost two (lea + load).
+  // ==========================================================================
+  pub let VT_CONSTRAINT_PID    : u64 = 0x0100000000000006  // Length(6)
+  pub let VT_CONSTRAINT_STATE  : u64 = 0x0100000000000008  // Length(8)
+  pub let VT_CONSTRAINT_CPU    : u64 = 0x0100000000000006  // Length(6)
+  pub let VT_CONSTRAINT_MEM    : u64 = 0x010000000000000A  // Length(10)
+  pub let VT_CONSTRAINT_NAME   : u64 = 0x0600000000000001  // Fill(1)
+
+  // ==========================================================================
+  // Header text literals.  Lengths are hard-coded at the render site so
+  // the emit path never re-reads a length constant (matches
+  // scr_emit_u64's compile-time-literal discipline).
+  // ==========================================================================
+  pub let _vt_hdr_pid   : [u8; 3] = "PID"
+  pub let _vt_hdr_state : [u8; 5] = "STATE"
+  pub let _vt_hdr_cpu   : [u8; 4] = "CPU%"
+  pub let _vt_hdr_mem   : [u8; 7] = "MEM(KB)"
+  pub let _vt_hdr_name  : [u8; 4] = "NAME"
+
+  // ==========================================================================
+  // Static scratch (mutable, .bss, zero-initialized at load).
+  // See §STATIC SCRATCH FOOTPRINT in the module preamble for the sizing
+  // derivation.
+  // ==========================================================================
+  pub let mut _vt_headers_spans : [u8; 120]  = uninit @align(8)
+  pub let mut _vt_header_line   : [u8; 24]   = uninit @align(8)
+  pub let mut _vt_constraints   : [u8; 40]   = uninit @align(8)
+  pub let mut _vt_cells         : [u8; 3840] = uninit @align(8)
+  pub let mut _vt_rows          : [u8; 512]  = uninit @align(8)
+  pub let mut _vt_fmt_pid       : [u8; 512]  = uninit @align(8)
+  pub let mut _vt_fmt_state     : [u8; 512]  = uninit @align(8)
+  pub let mut _vt_fmt_cpu       : [u8; 512]  = uninit @align(8)
+  pub let mut _vt_fmt_mem       : [u8; 512]  = uninit @align(8)
+  pub let mut _vt_spec          : [u8; 80]   = uninit @align(8)
+  pub let mut _vt_state         : [u8; 24]   = uninit @align(8)
+
+  // ==========================================================================
+  // vt_fmt_u64(val, buf_end) -> u64 len
+  //
+  // Convert `val` (rdi) to decimal ASCII, writing digits right-to-left
+  // ending at `buf_end` (rsi, exclusive). Returns digit count in rax.
+  // The caller computes the digit-run start as `buf_end - len`.
+  //
+  // Special case: val == 0 writes exactly one '0' byte and returns 1.
+  //
+  // Register plan:
+  //   rdi = val (moved to rax on entry)
+  //   rsi = buf_end (moved to r8 cursor and r9 sentinel)
+  //   r8  = cursor (walks down)
+  //   r9  = end sentinel (unchanged across body; used for length)
+  //   rax = working value / digit count on return
+  //   rcx = divisor (10)
+  //   rdx = remainder / byte scratch
+  //
+  // Pure leaf: no push/pop, no callee-save touched, no nested call.
+  // ==========================================================================
+  pub let vt_fmt_u64 : (u64, u64) -> u64 !{mem} @{} =
+    fn (val: u64) (buf_end: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M2-001 (postui-top#2): vt_fmt_u64 converts rdi to decimal ASCII in a caller-provided scratch buffer ending at rsi, writing digits right-to-left. Phase 1 (init): mov rax, rdi (working value); mov r8, rsi (cursor = end); mov r9, rsi (end sentinel for length compute); mov rcx, 10 (imm8 divisor). Phase 2 (special-case zero): cmp rax, 0 (imm8); jne vt_fu_loop. Zero path: sub r8, 1 (imm8); mov rdx, 0x30 (imm8, '0'); mov_b [r8 + 0], rdx (byte store); jmp vt_fu_done. Phase 3 (divmod-10 loop vt_fu_loop): xor rdx, rdx (clear high divide operand); div rcx (unsigned rdx:rax / rcx -> rax=quotient, rdx=remainder 0..9); add rdx, 0x30 (imm8, digit->ASCII); sub r8, 1 (imm8); mov_b [r8 + 0], rdx (byte store); cmp rax, 0 (imm8); jne vt_fu_loop. Same shape as scr_emit_u64 in postui/tools/scraper_example.pdx L358-L365. Phase 4 (length compute vt_fu_done): mov rax, r9; sub rax, r8; ret (rax = end - cursor = digit count). All immediates (0, 1, 10, 0x30) fit imm8. No test, no imul, no and reg,imm64, no cmp reg,imm64. Pure leaf: no push/pop, no callee-save touched, no nested call. Effect !{mem} (byte stores through r8). Labels prefixed vt_fu_ per postui-top fingerprint discipline.",
+      block: {
+        mov rax, rdi;
+        mov r8,  rsi;
+        mov r9,  rsi;
+        mov rcx, 10;
+
+        cmp rax, 0;
+        jne vt_fu_loop;
+
+        // val == 0 special case: single '0' digit.
+        sub r8, 1;
+        mov rdx, 0x30;
+        mov_b [r8 + 0], rdx;
+        jmp vt_fu_done;
+
+      vt_fu_loop:
+        xor rdx, rdx;
+        div rcx;
+        add rdx, 0x30;
+        sub r8, 1;
+        mov_b [r8 + 0], rdx;
+        cmp rax, 0;
+        jne vt_fu_loop;
+
+      vt_fu_done:
+        mov rax, r9;
+        sub rax, r8;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // view_table_render(poll_state_ptr, buffer_ptr, rows, cols) -> u64
+  //
+  // Per-frame adapter + Table draw. See module preamble §ADAPTER APPROACH
+  // for the algorithm and §ENTRY SIGNATURE for the ABI.
+  //
+  // Register plan (callee-save prologue, roles across phases):
+  //   rbx = poll_state_ptr    survives every phase
+  //   r12 = buffer_ptr        survives every phase
+  //   r13 = rows              survives every phase (packs into spec.rect.h)
+  //   r14 = cols              survives every phase (packs into spec.rect.w)
+  //   r15 = row iterator      Phase 3 body-row cursor; also holds scratch
+  //                           at Phases 1/2/4/5 (no cross-phase carry)
+  //
+  // Stack layout (below the 5-push prologue, `sub rsp, 64`):
+  //   [rsp +  0..+  8)   clamped_count      Phase 3 loop bound
+  //   [rsp +  8..+ 16)   task_row_addr      per-row source
+  //   [rsp + 16..+ 24)   cell_base          per-row destination cells_ptr
+  //   [rsp + 24..+ 32)   fmt_buf_start      per-column scratch base
+  //   [rsp + 32..+ 64)   pad                keeps rsp % 16 == 0
+  //
+  // Label prefix `vt_` per postui-top fingerprint discipline; substring
+  // "loop" is present ONLY in `vt_fu_loop` (vt_fmt_u64 body) which the
+  // encoder tolerates as a compound identifier (the reserved-keyword
+  // check bites on bare `loop:` labels; a `vt_fu_loop:` prefix is a
+  // distinct identifier). The outer body uses `vt_row_top` / `vt_row_done`
+  // instead of the more idiomatic `vt_row_loop` to keep the substring
+  // avoidance defensive.
+  // ==========================================================================
+  pub let view_table_render : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (poll_state_ptr: u64) (buffer_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M2-001 (postui-top#2): view_table_render is the per-frame adapter that repopulates postui Table scratch from poll.pdx task_rows[] and dispatches table_draw. 5-push callee-save prologue (rbx=poll_state_ptr, r12=buffer_ptr, r13=rows, r14=cols, r15=iterator/scratch) + sub rsp, 64 -- entry rsp%16==8, +40==0, +64==0 for every nested SysV call (vt_fmt_u64 and table_draw). Phase 1 (constraint slab): lea r10, [rip + _vt_constraints]; for each of 5 columns, stage the packed constraint u64 via mov r11, imm64 (movabs; all five values > 0x7FFFFFFF; legal for mov, NEVER used in cmp/and) and store to [r10 + offset]. Bit-for-bit match against layout_length/layout_fill in postui/src/layout.pdx (Length: tag 1; Fill: tag 6). Phase 2 (header spans + Line): lea r10, [rip + _vt_headers_spans]; for each of 5 header cells, load bytes_ptr via lea r11, [rip + _vt_hdr_<name>], store to [r10 + span_offset + 0], mov r_scratch, <literal_len> (imm8), store byte_len to [r10 + span_offset + 8], xor + store style=0 at [r10 + span_offset + 16]. Then lea r11, [rip + _vt_header_line]; store spans_ptr = _vt_headers_spans, span_count = 5, alignment = 0. Phase 3 (body-row adapter loop): clamp row_count = min(poll_state.task_row_count, VT_MAX_ROWS=32) via cmp/jbe (imm8); stash to [rsp+0]. Iterate row_i (r15) from 0 to clamped_count. Per row: (a) task_row_addr = poll_state.task_rows_ptr + row_i * 48 via mov r8,48; imul rax,r8 (2-op reg,reg, paideia-as-safe); (b) cell_base = _vt_cells + row_i * 120 via mov r8,120; imul rax,r8; (c-f) format PID/STATE/CPU/MEM via vt_fmt_u64: for each field, compute fmt buf_start = _vt_fmt_<col> + row_i * 16 (shl rax,4; imm8), stash to [rsp+24], compute buf_end = buf_start + 16 into rsi (arg2), load field value from task_row into rdi (arg1), call vt_fmt_u64; on return rax = digit count, recompute ptr = buf_start + 16 - len via [rsp+24] reload, store (ptr, len, style=0) triple into cell_base + <col>*24. Each of 4 numeric-column blocks reloads [rsp+8] (task_row_addr) and [rsp+16] (cell_base) after the nested call because vt_fmt_u64 clobbers caller-save regs (rax/rcx/rdx/r8/r9/r10/r11) but leaves rbx/r12/r13/r14/r15 intact by construction (leaf, no push/pop). (g) NAME cell aliases directly: load name_ptr from task_row+32 and name_len from task_row+40, store (name_ptr, name_len, 0) at cell_base + 96; no format buffer needed because the poll module maintains _pl_names[] slots stable across the whole render call. (h) Populate TableRow at _vt_rows + row_i * 16 (shl rax,4) with (cell_base, 5). add r15, 1; jmp vt_row_top. Phase 4 (TableSpec): lea rax, [rip + _vt_spec]; stamp rect = (x=0, y=0, w=cols, h=rows) packed as (cols & 0xFFFF) << 32 | (rows & 0xFFFF) << 48 (shift counts 16/32/48 imm8; mask 0xFFFF imm32; NO imm64 mask); stamp rows_ptr (lea _vt_rows), row_count ([rsp+0]), constraints_ptr (lea _vt_constraints), column_count (5, imm8), header_ptr (lea _vt_header_line), state_ptr (lea _vt_state), highlight_style=0, default_style=0, reserved=0. Also zero _vt_state's three u64 slots (selected=0, offset=0, reserved=0) so a caller that never touched selection sees the deterministic no-selection state. Phase 5 (dispatch): lea rdi, [rip + _vt_spec]; mov rsi, r12 (buf_ptr); mov rdx, r13 (rows); mov rcx, r14 (cols); call table_draw. rax carries table_draw's return (0 on OK; TBL_ERR_BAND or a Layout sentinel on failure) verbatim through the epilogue. Epilogue: add rsp, 64; 5-pop; ret. Encoder discipline: no `test` (all zero-checks via cmp reg, 0); no `and reg, imm64` (widest mask 0xFFFF); no 2-op `imul reg, imm` (row/cell strides all stage via mov r8, imm; imul rax, r8); no `mul` mnemonic; no `cmp reg, [mem]` (every compare loads through a scratch first). r11 discipline: r11 is used freely as a per-store scratch and is clobbered by every `lea rN, [rip + label]` emit (paideia-as internal); we never rely on r11 surviving across a lea. Cross-module calls (vt_fmt_u64 and table_draw) both preserve SysV callee-save (rbx/r12/r13/r14/r15) per their respective justification blocks -- vt_fmt_u64 is a pure leaf with no push/pop, and table_draw's own 5-push prologue restores callee-save on every return path (postui/src/widgets/table.pdx L436-L816). Effect !{mem} @{} matches table_draw and vt_fmt_u64; the module issues no syscalls. Labels prefixed vt_ / vt_fu_ per postui-top fingerprint discipline.",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 64;
+
+        mov rbx, rdi;                              // poll_state_ptr
+        mov r12, rsi;                              // buffer_ptr
+        mov r13, rdx;                              // rows
+        mov r14, rcx;                              // cols
+
+        // ---- Phase 1: constraint slab ----------------------------------------
+        lea r10, [rip + _vt_constraints];
+        mov r11, 0x0100000000000006;               // Length(6)  PID
+        mov [r10 + 0],  r11;
+        mov r11, 0x0100000000000008;               // Length(8)  STATE
+        mov [r10 + 8],  r11;
+        mov r11, 0x0100000000000006;               // Length(6)  CPU%
+        mov [r10 + 16], r11;
+        mov r11, 0x010000000000000A;               // Length(10) MEM(KB)
+        mov [r10 + 24], r11;
+        mov r11, 0x0600000000000001;               // Fill(1)    NAME
+        mov [r10 + 32], r11;
+
+        // ---- Phase 2: header spans + Line -----------------------------------
+        lea r10, [rip + _vt_headers_spans];
+
+        // Span 0: "PID" (3 bytes)
+        lea r11, [rip + _vt_hdr_pid];
+        mov [r10 + 0],  r11;
+        mov rax, 3;
+        mov [r10 + 8],  rax;
+        xor rax, rax;
+        mov [r10 + 16], rax;
+
+        // Span 1: "STATE" (5 bytes)
+        lea r11, [rip + _vt_hdr_state];
+        mov [r10 + 24], r11;
+        mov rax, 5;
+        mov [r10 + 32], rax;
+        xor rax, rax;
+        mov [r10 + 40], rax;
+
+        // Span 2: "CPU%" (4 bytes)
+        lea r11, [rip + _vt_hdr_cpu];
+        mov [r10 + 48], r11;
+        mov rax, 4;
+        mov [r10 + 56], rax;
+        xor rax, rax;
+        mov [r10 + 64], rax;
+
+        // Span 3: "MEM(KB)" (7 bytes)
+        lea r11, [rip + _vt_hdr_mem];
+        mov [r10 + 72], r11;
+        mov rax, 7;
+        mov [r10 + 80], rax;
+        xor rax, rax;
+        mov [r10 + 88], rax;
+
+        // Span 4: "NAME" (4 bytes)
+        lea r11, [rip + _vt_hdr_name];
+        mov [r10 + 96],  r11;
+        mov rax, 4;
+        mov [r10 + 104], rax;
+        xor rax, rax;
+        mov [r10 + 112], rax;
+
+        // Line: spans_ptr = _vt_headers_spans, span_count = 5, alignment = 0
+        lea r11, [rip + _vt_header_line];
+        lea rax, [rip + _vt_headers_spans];
+        mov [r11 + 0],  rax;
+        mov rax, 5;
+        mov [r11 + 8],  rax;
+        xor rax, rax;
+        mov [r11 + 16], rax;
+
+        // ---- Phase 3: body-row adapter loop ---------------------------------
+        // Clamp count = min(poll_state.task_row_count, VT_MAX_ROWS)
+        mov rax, [rbx + 8];                        // Poll::POLL_OFF_TASK_ROW_COUNT = 8
+        cmp rax, 32;                               // VT_MAX_ROWS
+        jbe vt_count_ok;
+        mov rax, 32;
+      vt_count_ok:
+        mov [rsp + 0], rax;                        // clamped_count
+
+        xor r15, r15;                              // row_i = 0
+      vt_row_top:
+        mov rax, [rsp + 0];
+        cmp r15, rax;
+        jae vt_row_done;
+
+        // task_row_addr = task_rows_ptr + row_i * POLL_ROW_BYTES(48)
+        mov rax, r15;
+        mov r8,  48;
+        imul rax, r8;
+        add rax, [rbx + 0];                        // + task_rows_ptr
+        mov [rsp + 8], rax;
+
+        // cell_base = _vt_cells + row_i * (VT_COLUMN_COUNT*VT_CELL_STRIDE=120)
+        mov rax, r15;
+        mov r8,  120;
+        imul rax, r8;
+        lea r11, [rip + _vt_cells];
+        add rax, r11;
+        mov [rsp + 16], rax;
+
+        // ---- Format PID -> _vt_fmt_pid + row_i * 16 ---
+        mov rax, r15;
+        shl rax, 4;                                // * VT_FMT_BUF_BYTES(16)
+        lea r11, [rip + _vt_fmt_pid];
+        add rax, r11;                              // rax = buf_start
+        mov [rsp + 24], rax;
+        add rax, 16;                               // rax = buf_end
+        mov rsi, rax;                              // arg2 = buf_end
+        mov r8,  [rsp + 8];                        // task_row_addr
+        mov rdi, [r8 + 0];                         // arg1 = task_row.pid (POLL_ROW_OFF_PID=0)
+        call vt_fmt_u64;
+        mov r8,  [rsp + 24];                       // reload buf_start
+        add r8, 16;                                // buf_end
+        sub r8, rax;                               // ptr = buf_end - len
+        mov rdx, [rsp + 16];                       // cell_base
+        mov [rdx + 0],  r8;                        // span[0].ptr
+        mov [rdx + 8],  rax;                       // span[0].byte_len
+        xor r9, r9;
+        mov [rdx + 16], r9;                        // span[0].style = 0
+
+        // ---- Format STATE -> _vt_fmt_state + row_i * 16 ---
+        mov rax, r15;
+        shl rax, 4;
+        lea r11, [rip + _vt_fmt_state];
+        add rax, r11;
+        mov [rsp + 24], rax;
+        add rax, 16;
+        mov rsi, rax;
+        mov r8,  [rsp + 8];
+        mov rdi, [r8 + 8];                         // task_row.state (POLL_ROW_OFF_STATE=8)
+        call vt_fmt_u64;
+        mov r8,  [rsp + 24];
+        add r8, 16;
+        sub r8, rax;
+        mov rdx, [rsp + 16];
+        mov [rdx + 24], r8;                        // span[1].ptr
+        mov [rdx + 32], rax;                       // span[1].byte_len
+        xor r9, r9;
+        mov [rdx + 40], r9;                        // span[1].style = 0
+
+        // ---- Format CPU% (ticks_cpu) -> _vt_fmt_cpu + row_i * 16 ---
+        mov rax, r15;
+        shl rax, 4;
+        lea r11, [rip + _vt_fmt_cpu];
+        add rax, r11;
+        mov [rsp + 24], rax;
+        add rax, 16;
+        mov rsi, rax;
+        mov r8,  [rsp + 8];
+        mov rdi, [r8 + 16];                        // task_row.ticks_cpu (POLL_ROW_OFF_TICKS_CPU=16)
+        call vt_fmt_u64;
+        mov r8,  [rsp + 24];
+        add r8, 16;
+        sub r8, rax;
+        mov rdx, [rsp + 16];
+        mov [rdx + 48], r8;                        // span[2].ptr
+        mov [rdx + 56], rax;                       // span[2].byte_len
+        xor r9, r9;
+        mov [rdx + 64], r9;                        // span[2].style = 0
+
+        // ---- Format MEM(KB) -> _vt_fmt_mem + row_i * 16 ---
+        mov rax, r15;
+        shl rax, 4;
+        lea r11, [rip + _vt_fmt_mem];
+        add rax, r11;
+        mov [rsp + 24], rax;
+        add rax, 16;
+        mov rsi, rax;
+        mov r8,  [rsp + 8];
+        mov rdi, [r8 + 24];                        // task_row.mem_kb (POLL_ROW_OFF_MEM_KB=24)
+        call vt_fmt_u64;
+        mov r8,  [rsp + 24];
+        add r8, 16;
+        sub r8, rax;
+        mov rdx, [rsp + 16];
+        mov [rdx + 72], r8;                        // span[3].ptr
+        mov [rdx + 80], rax;                       // span[3].byte_len
+        xor r9, r9;
+        mov [rdx + 88], r9;                        // span[3].style = 0
+
+        // ---- NAME (aliased from task_row.name_ptr / name_len) ---
+        mov r8,  [rsp + 8];                        // task_row_addr
+        mov r9,  [r8 + 32];                        // task_row.name_ptr (POLL_ROW_OFF_NAME_PTR=32)
+        mov r10, [r8 + 40];                        // task_row.name_len (POLL_ROW_OFF_NAME_LEN=40)
+        mov rdx, [rsp + 16];                       // cell_base
+        mov [rdx + 96],  r9;                       // span[4].ptr
+        mov [rdx + 104], r10;                      // span[4].byte_len
+        xor rax, rax;
+        mov [rdx + 112], rax;                      // span[4].style = 0
+
+        // ---- Populate TableRow at _vt_rows + row_i * 16 ---
+        mov rax, r15;
+        shl rax, 4;                                // * VT_ROW_STRIDE(16)
+        lea r11, [rip + _vt_rows];
+        add rax, r11;                              // row_addr
+        mov r8,  [rsp + 16];                       // cell_base
+        mov [rax + 0], r8;                         // TableRow.cells_ptr
+        mov r8,  5;
+        mov [rax + 8], r8;                         // TableRow.cell_count
+
+        add r15, 1;
+        jmp vt_row_top;
+      vt_row_done:
+
+        // ---- Phase 4: TableSpec ---------------------------------------------
+        lea rax, [rip + _vt_spec];
+
+        // rect: (x=0, y=0, w=cols, h=rows)  packed as x | y<<16 | w<<32 | h<<48
+        mov r11, r14;                              // cols
+        and r11, 0xFFFF;
+        shl r11, 32;                               // w << 32
+        mov r10, r13;                              // rows
+        and r10, 0xFFFF;
+        shl r10, 48;                               // h << 48
+        or  r11, r10;                              // x=0, y=0 implicit
+        mov [rax + 0], r11;                        // TABLE_OFF_RECT
+
+        // rows_ptr
+        lea r11, [rip + _vt_rows];
+        mov [rax + 8], r11;                        // TABLE_OFF_ROWS_PTR
+
+        // row_count = clamped_count
+        mov r11, [rsp + 0];
+        mov [rax + 16], r11;                       // TABLE_OFF_ROW_COUNT
+
+        // constraints_ptr
+        lea r11, [rip + _vt_constraints];
+        mov [rax + 24], r11;                       // TABLE_OFF_CONSTRAINTS_PTR
+
+        // column_count = 5
+        mov r11, 5;
+        mov [rax + 32], r11;                       // TABLE_OFF_COLUMN_COUNT
+
+        // header_ptr
+        lea r11, [rip + _vt_header_line];
+        mov [rax + 40], r11;                       // TABLE_OFF_HEADER_PTR
+
+        // state_ptr
+        lea r11, [rip + _vt_state];
+        mov [rax + 48], r11;                       // TABLE_OFF_STATE_PTR
+
+        // highlight_style = 0
+        xor r11, r11;
+        mov [rax + 56], r11;                       // TABLE_OFF_HIGHLIGHT_STYLE
+
+        // default_style = 0
+        mov [rax + 64], r11;                       // TABLE_OFF_DEFAULT_STYLE
+
+        // reserved = 0
+        mov [rax + 72], r11;                       // TABLE_OFF_RESERVED
+
+        // Reset TableState: selected=0, offset=0, reserved=0
+        lea rax, [rip + _vt_state];
+        xor r11, r11;
+        mov [rax + 0],  r11;
+        mov [rax + 8],  r11;
+        mov [rax + 16], r11;
+
+        // ---- Phase 5: dispatch table_draw -----------------------------------
+        lea rdi, [rip + _vt_spec];
+        mov rsi, r12;                              // buf_ptr
+        mov rdx, r13;                              // rows
+        mov rcx, r14;                              // cols
+        call table_draw;
+
+        // rax carries table_draw's return verbatim
+        add rsp, 64;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

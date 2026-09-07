@@ -48,7 +48,8 @@ caps_decl   = caps.decl
 # tools/build.sh. M1-001 seeds only src/poll.pdx; the M1-002..M4-004
 # landings each add their own source entry as the module body lands.
 sources:
-  - src/poll.pdx                  # M1-001 (this issue): PollState + poll_init + poll_tick sys_taskinfo consumer
+  - src/poll.pdx                  # M1-001: PollState + poll_init + poll_tick sys_taskinfo consumer
+  - src/view_table.pdx            # M2-001 (this issue): ViewTable adapter -- postui Table draw wired to poll.pdx task_rows
 
 # --- Library dependencies -----------------------------------------------
 # postui (the widget library at ../postui, v1.0.0 shipped at
