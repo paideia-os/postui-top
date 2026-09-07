@@ -1,0 +1,349 @@
+// src/view_sparkline.pdx -- postui-top.M3-001 (paideia-os/postui-top#4)
+//
+// ViewSparkline module: rolling-window CPU history sparkline.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1 postui-top reference app, M3-001 slot)
+// =============================================================================
+//
+// M1-001 landed the poll loop (src/poll.pdx: PollState + task_rows[]).
+// M2-001 landed the Table view (src/view_table.pdx: table_draw wire).
+// M3-001 (THIS landing) introduces the sparkline history view: a fixed-
+// depth rolling window of aggregate CPU samples (one push per poll_tick)
+// visualized via postui.M3-003's `sparkline_draw` widget. The M3-002
+// Tabs landing will subdivide the canvas rect between the Table and this
+// Sparkline; at this M3-001 slot the view is a stand-alone renderer
+// whose caller decides the rect (via the caller-provided SparklineSpec
+// scratch it hands to view_sparkline_render).
+//
+// This module ships:
+//
+//   * Two .bss statics -- a 64-slot u64 ring buffer (_vs_history) and
+//     a single-slot ring cursor (_vs_head). Both are @align(8) so a
+//     downstream u64 load is naturally aligned.
+//   * `view_sparkline_push(cpu_sample) -> u64` -- append one sample to
+//     the ring, advance the cursor mod 64. Nullary-return-value in
+//     spirit (task text says "-> void"); the pdx surface has no void
+//     type, so the wrapper returns 0 in rax as a no-error convention
+//     (mirrors poll_init's return-0 posture at M1-001).
+//   * `view_sparkline_render(spec_ptr, buf_ptr, rows, cols) -> u64` --
+//     stamp values_ptr = &_vs_history[0] and value_count = VS_RING_SLOTS
+//     into the caller-provided SparklineSpec, then dispatch
+//     `sparkline_draw`. Rect / style / max_override are caller-owned
+//     and passed through untouched.
+//
+// =============================================================================
+// SIGNATURE / DATA-SOURCE INTERPRETATION
+// =============================================================================
+//
+// The M3-001 issue text prescribes:
+//
+//   view_sparkline_render(spec_ptr, buf, rows, cols) -> u64:
+//     - Build SparklineSpec pointing at _vs_history[0], value_count=64.
+//     - Call postui.sparkline_draw.
+//
+// The `spec_ptr` argument shape matches view_table_render's
+// `poll_state_ptr` slot -- the FIRST arg names the data-adjacent input.
+// For view_table_render that arg is the data source itself (poll_state);
+// for view_sparkline_render the DATA source is this module's internal
+// _vs_history ring, so spec_ptr instead carries the CALLER-owned
+// SparklineSpec scratch (rect + style + max_override -- the geometry
+// and normalization the caller wants for this frame). This module
+// stamps ONLY the two fields the ring buffer is authoritative for
+// (values_ptr + value_count), leaving the caller's rect / style /
+// max_override intact so:
+//
+//   * A future M3-002 Tabs landing can pass a sub-rect (not the full
+//     canvas) without churning view_sparkline_render's surface.
+//   * A caller wanting a pinned Y-axis at max_override = 100 (%) for a
+//     CPU% series can set it once at startup rather than re-computing
+//     per frame.
+//
+// =============================================================================
+// RING-BUFFER LAYOUT + WRAP-SEAM ACKNOWLEDGMENT
+// =============================================================================
+//
+//   _vs_history[i] = u64 sample slot; storage stride = 8 bytes.
+//   _vs_head       = u64 write cursor in [0, VS_RING_SLOTS = 64).
+//
+// Push semantics:
+//   store _vs_history[_vs_head] = sample
+//   _vs_head = (_vs_head + 1) & (VS_RING_SLOTS - 1)     [mod 64, imm8]
+//
+// At every render call this module passes values_ptr = &_vs_history[0]
+// with value_count = VS_RING_SLOTS = 64 verbatim -- i.e. the sparkline
+// reads the ring in INSERTION-POSITION order, NOT chronological order.
+// The visible consequence: the sample "just written" (slot _vs_head - 1)
+// sits at some interior column, and the leftmost columns of the drawn
+// strip carry the OLDEST live sample (slot _vs_head, about to be
+// overwritten). Where the ring wraps between samples N-64 and N, a
+// discontinuity ("wrap seam") appears at column _vs_head; the vertical
+// jump has no monitoring semantics -- it is a rendering artefact of
+// the raw ring-through-strip mapping.
+//
+// The postui.M3-003 SparklineSpec authors documented this contract:
+//
+//   values[] -- draw reads up to min(value_count, Rect.w) points; the
+//   rightmost data points of a longer series are dropped, not the
+//   leftmost. Callers wanting a ring-buffer newest-N view must reslice
+//   their pointer before the call.
+//                          -- postui/src/widgets/sparkline.pdx L64-L69
+//
+// The seam is therefore an ACKNOWLEDGED v1 limitation for this
+// M3-001 landing. Two follow-up shapes are viable without touching
+// this module's callers:
+//
+//   (a) Linearize into a second BSS ring at render time (adds
+//       VS_RING_SLOTS * 8 = 512 B scratch + one 64-iter copy loop).
+//   (b) Split the ring into two consecutive sparkline_draw calls on
+//       adjacent sub-rects (slots [head..64) then [0..head)).
+//
+// Both are M3-002+ hardening items; either lands as a single-function
+// refactor here with no external surface churn.
+//
+// =============================================================================
+// PRE-FILL TRANSIENT (first VS_RING_SLOTS pushes)
+// =============================================================================
+//
+// _vs_history is BSS (zero-initialized at load); until 64 pushes have
+// completed the ring holds a mix of live samples and residual zeros.
+// The postui sparkline_draw path treats a zero value as "skip this
+// column" (space-filled from phase 1, no bar stamp -- see
+// postui/src/widgets/sparkline.pdx L639-L641). Startup therefore
+// shows a partial strip that grows to full occupancy after ~64 poll
+// ticks; no separate "count of populated slots" bookkeeping is
+// needed. A caller wanting max_override auto-scaling before the
+// ring fills can set max_override != 0 (the auto-max path
+// short-circuits with the caller-pinned ceiling).
+//
+// =============================================================================
+// STATIC SCRATCH FOOTPRINT (BSS, zero-initialized at load)
+// =============================================================================
+//
+//   _vs_history  [u64; 64]  = 512 bytes    rolling sample ring
+//   _vs_head     [u64; 1]   =   8 bytes    write cursor mod VS_RING_SLOTS
+//
+// Total = 520 bytes (< 1 page). Sized to match the task-spec directly;
+// growing VS_RING_SLOTS to a larger power-of-two (128, 256) is a
+// one-constant edit here -- the `and rax, VS_RING_MASK` in the push
+// body auto-follows so long as VS_RING_SLOTS stays a power of two
+// (mask arithmetic; a non-power-of-two would need a `div` fallback).
+//
+// =============================================================================
+// SC+ / KERNEL EFFECT SURFACE
+// =============================================================================
+//
+// Neither function issues a syscall. `view_sparkline_push` writes one
+// qword to _vs_history and updates _vs_head; `view_sparkline_render`
+// stamps two qwords into the caller-provided SparklineSpec and then
+// calls `sparkline_draw`, which itself is a memory-only widget draw.
+// Effect row `!{mem}` @{} matches sparkline_draw's own effect. No
+// capability gate.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewSparkline`), matches file
+//     basename view_sparkline.pdx (module-basename-pascal invariant;
+//     manifest.pdxproj compliance flag).
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp/and fits imm32 (widest is
+//     VS_RING_MASK = 63; all others are small).
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all
+//     (index scaling folds to `shl rax, 3` for the *8 stride).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first -- there are
+//     none in this module because both bodies are branch-free
+//     modulo the alignment sub/add pair in the render wrapper).
+//   - Every `pub let` declaration is single-line (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `vs_*` per the postui-top fingerprint discipline. Substring
+//     "loop" avoided defensively (there are no branches in this
+//     module -- both bodies are straight-line).
+//   - r11 usage: view_sparkline_push uses r11 as the base-address
+//     register for two `lea r11, [rip + label]` sites -- paideia-as's
+//     `lea reg, [rip + label]` uses r11 as internal scratch (see
+//     postui/src/widgets/sparkline.pdx L442-L446 discipline note), so
+//     the destination register IS r11 and no other state relies on
+//     r11 surviving those lea instructions. view_sparkline_render's
+//     one lea site targets rax and again nothing else lives in r11.
+//   - SysV push/pop parity:
+//       * view_sparkline_push: pure leaf (no push/pop, no callee-save
+//         touched, no nested call).
+//       * view_sparkline_render: entry rsp%16==8; `sub rsp, 8` before
+//         the call to sparkline_draw makes rsp%16==0 at the callsite
+//         (SysV nested-call invariant). `add rsp, 8` restores before
+//         `ret`. No callee-save regs touched -- neither this wrapper
+//         nor any prior state needs to survive the sparkline_draw call,
+//         and the four SysV arg regs (rdi/rsi/rdx/rcx) pass through
+//         unclobbered because none of the stamp stores use them as
+//         scratch.
+
+module ViewSparkline = structure {
+
+  // ==========================================================================
+  // Sizing constants
+  //
+  // VS_RING_SLOTS is a compile-time power-of-two -- the push body's mod
+  // fold uses `and rax, VS_RING_MASK` (imm8) rather than an `xor/div`
+  // pair. A future revision that wants a different depth (128, 256)
+  // updates both constants together (mask = slots - 1) and re-grows
+  // the _vs_history array; nothing else changes.
+  // ==========================================================================
+  pub let VS_RING_SLOTS : u64 = 64
+  pub let VS_RING_MASK  : u64 = 63    // VS_RING_SLOTS - 1
+  pub let VS_SLOT_BYTES : u64 = 8     // sizeof(u64)
+
+  // ==========================================================================
+  // SparklineSpec field offsets (mirror of postui/src/widgets/sparkline.pdx
+  // SPARKLINE_OFF_* -- named locally so the render body's stamp sites
+  // read from a self-documenting symbol and a downstream SparklineSpec
+  // layout revision is caught at exactly one place).
+  // ==========================================================================
+  pub let VS_SPEC_OFF_VALUES_PTR  : u64 = 8
+  pub let VS_SPEC_OFF_VALUE_COUNT : u64 = 16
+
+  // ==========================================================================
+  // Static storage. Both live in .bss (zero-initialized at load). The
+  // push body overwrites _vs_history slots in ring-cursor order; the
+  // render body reads through the same base address without ever
+  // mutating either static.
+  // ==========================================================================
+  pub let mut _vs_history : [u64; 64] = uninit @align(8)
+  pub let mut _vs_head    : [u64; 1]  = uninit @align(8)
+
+  // ==========================================================================
+  // view_sparkline_push(cpu_sample) -> u64
+  //
+  // Append one CPU sample to the rolling ring, advance the cursor mod
+  // VS_RING_SLOTS. Returns 0 (task-spec "-> void"; pdx has no void type
+  // so the wrapper returns 0 in rax as a no-error convention, matching
+  // poll_init's posture at M1-001).
+  //
+  // Contract:
+  //   rdi = cpu_sample     u64 aggregate CPU tick (or CPU%) sample
+  //   -> rax = 0           always
+  //
+  // Algorithm:
+  //   head = _vs_head[0]
+  //   _vs_history[head] = rdi
+  //   _vs_head[0] = (head + 1) & VS_RING_MASK
+  //   return 0
+  //
+  // Register plan (pure leaf, no push/pop, no nested call):
+  //   rax = head (loaded, then reused as byte offset via shl 3)
+  //   r10 = head-copy preserved across the shl for the +1&mask step
+  //   r11 = lea scratch for [rip + _vs_history] / [rip + _vs_head]
+  //         (paideia-as internal-scratch convention -- see
+  //          postui/src/widgets/sparkline.pdx L442-L446)
+  //
+  // Labels: none (linear body, no branches). The `vs_*` prefix is
+  // reserved for any future branch label; substring "loop" is
+  // defensively avoided even inside a compound identifier.
+  // ==========================================================================
+  pub let view_sparkline_push : (u64) -> u64 !{mem} @{} =
+    fn (cpu_sample: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M3-001 (postui-top#4): view_sparkline_push appends one u64 CPU sample to the _vs_history rolling ring and advances _vs_head mod VS_RING_SLOTS=64. Pure leaf: no push/pop, no callee-save touched, no nested call. Phase 1 (load head): mov rax, [rip + _vs_head + 0] -- direct RIP-relative load, no r11 scratch involvement (paideia-as pitfall #1248 note: only `lea reg, [rip + label]` uses r11 as internal scratch; plain `mov reg, [rip + label + offset]` does not, per postui/src/poll.pdx L480 precedent). Phase 2 (compute slot address + store sample): mov r10, rax (save head for the +1&mask step); shl rax, 3 (rax = head * VS_SLOT_BYTES=8, imm8); lea r11, [rip + _vs_history] (r11 is both destination and paideia-as internal scratch -- no conflict); add r11, rax (r11 = &_vs_history[head]); mov [r11 + 0], rdi (store sample). Phase 3 (advance cursor mod 64): add r10, 1 (imm8); and r10, 63 (VS_RING_MASK, imm8 -- power-of-two mod fold, no div); lea r11, [rip + _vs_head] (fresh lea, r11 re-clobber safe); mov [r11 + 0], r10 (store new head). Phase 4 (return 0): xor rax, rax; ret. Encoder discipline: no `test` (no branches); no imul (index stride is shl 3); no `and reg, imm64` (mask is 63, imm8); no `cmp reg, imm64`; no `cmp reg, [mem]`; no `mul` mnemonic. Every immediate (0, 1, 3, 63) fits imm8. Byte-load discipline not applicable (all loads/stores are qword). No callee-save regs touched -- rdi (arg), rax/r10/r11 (SysV caller-save) sole registers used. Effect !{mem} (writes _vs_history and _vs_head; reads _vs_head). Labels prefixed vs_ per postui-top fingerprint discipline; substring \"loop\" avoided defensively.",
+      block: {
+        // Phase 1: load head into rax
+        mov rax, [rip + _vs_head + 0];
+
+        // Phase 2: compute _vs_history[head] address + store sample
+        mov r10, rax;                              // save head-copy for phase 3
+        shl rax, 3;                                // rax = head * VS_SLOT_BYTES(8)
+        lea r11, [rip + _vs_history];
+        add r11, rax;                              // r11 = &_vs_history[head]
+        mov [r11 + 0], rdi;                        // store cpu_sample
+
+        // Phase 3: advance cursor mod VS_RING_SLOTS
+        add r10, 1;                                // head + 1
+        and r10, 63;                               // & VS_RING_MASK (mod 64)
+        lea r11, [rip + _vs_head];
+        mov [r11 + 0], r10;                        // store new head
+
+        // Phase 4: return 0 (no-error convention for a void-shaped op)
+        xor rax, rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // view_sparkline_render(spec_ptr, buf_ptr, rows, cols) -> u64
+  //
+  // Stamp values_ptr = &_vs_history[0] and value_count = VS_RING_SLOTS
+  // into the caller-provided SparklineSpec at spec_ptr, then dispatch
+  // sparkline_draw. Rect / style / max_override at spec_ptr are caller-
+  // owned and pass through untouched (see §SIGNATURE / DATA-SOURCE
+  // INTERPRETATION for the layered-caller rationale).
+  //
+  // Contract:
+  //   rdi = spec_ptr       VA of a 40-byte SparklineSpec (see
+  //                        postui/src/widgets/sparkline.pdx L268)
+  //                        with rect/max_override/style pre-populated
+  //                        by the caller
+  //   rsi = buf_ptr        VA of a rows*cols grid of 16-byte Cells
+  //   rdx = rows           canvas row count (unread by sparkline_draw
+  //                        per its documented posture, but preserved
+  //                        through this wrapper for signature parity)
+  //   rcx = cols           canvas col count (used by sparkline_draw
+  //                        for the dst = buf + (y*cols+x)*16 fold)
+  //   -> rax               0 on success, or the postui SPK_ERR_BAND
+  //                        (0xFFFFEBD3) verbatim from sparkline_draw
+  //                        (v1 sparkline_draw never returns this
+  //                        sentinel; reserved for a future revision).
+  //
+  // Algorithm:
+  //   [spec_ptr + VS_SPEC_OFF_VALUES_PTR]  = &_vs_history[0]
+  //   [spec_ptr + VS_SPEC_OFF_VALUE_COUNT] = VS_RING_SLOTS
+  //   return sparkline_draw(spec_ptr, buf_ptr, rows, cols)
+  //
+  // Register plan:
+  //   rdi / rsi / rdx / rcx = SysV args (all preserved through the two
+  //                                       stamp stores; the stamps use
+  //                                       rax as their transient value
+  //                                       and r11 as the lea's internal
+  //                                       scratch, neither of which is
+  //                                       an arg reg).
+  //   rax = transient value for both stamps (lea target for values_ptr,
+  //         immediate 64 for value_count)
+  //   r11 = lea internal scratch (destination is rax for the sole lea
+  //         site in this body; r11 is clobbered as a side-effect but no
+  //         subsequent instruction reads it)
+  //
+  // Stack: `sub rsp, 8` before the call (SysV entry rsp%16==8; +8 ->
+  // rsp%16==0 at the sparkline_draw callsite, satisfying its own
+  // 5-push+80-scratch alignment expectations). No callee-save regs
+  // touched.
+  //
+  // Labels: none (linear body). Fingerprint prefix reserved as `vs_`.
+  // ==========================================================================
+  pub let view_sparkline_render : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (spec_ptr: u64) (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M3-001 (postui-top#4): view_sparkline_render is the per-frame CPU-history renderer -- stamps values_ptr and value_count into the caller-provided SparklineSpec and forwards the same rdi/rsi/rdx/rcx quadruple to sparkline_draw. Phase 1 (align stack): sub rsp, 8 -- SysV entry rsp%16==8, +8 -> rsp%16==0 for the nested sparkline_draw call (which itself does 5 pushes + sub rsp, 80 = 120B keeping its own frame 16B-aligned per postui/src/widgets/sparkline.pdx L400 discipline). Phase 2 (stamp values_ptr): lea rax, [rip + _vs_history] (r11 clobbered as paideia-as internal scratch -- harmless, no state in r11); mov [rdi + 8], rax (SPARKLINE_OFF_VALUES_PTR=8, imm8). Phase 3 (stamp value_count): mov rax, 64 (VS_RING_SLOTS, imm8); mov [rdi + 16], rax (SPARKLINE_OFF_VALUE_COUNT=16, imm8). Phase 4 (dispatch): call sparkline_draw -- rdi/rsi/rdx/rcx all still hold the caller's original arg quadruple (none of Phases 2/3 touched them). Phase 5 (epilogue): add rsp, 8; ret -- rax carries sparkline_draw's return verbatim (0 on OK; SPK_ERR_BAND 0xFFFFEBD3 reserved for future). Encoder discipline: no `test`; no imul; no `and reg, imm64`; no `cmp reg, imm64`; no `cmp reg, [mem]`; no `mul` mnemonic; every immediate (8, 16, 64) fits imm8. Only one lea site (Phase 2) -- the r11 clobber is isolated. No callee-save touched (no push/pop of rbx/r12/r13/r14/r15 needed because this wrapper carries no state across the nested call -- the only value that must survive is rax, which is sparkline_draw's own return). Effect !{mem} matches sparkline_draw's own effect (spec-slot stamps + values-array read + cell writes). Labels: none (straight-line body). Cross-module symbol: sparkline_draw resolves at link-time against postui/src/widgets/sparkline.pdx per the deps: postui @ ^0.1 entry in manifest.pdxproj.",
+      block: {
+        // Phase 1: align stack for nested SysV call
+        sub rsp, 8;
+
+        // Phase 2: stamp values_ptr = &_vs_history[0] into spec_ptr[+8]
+        lea rax, [rip + _vs_history];
+        mov [rdi + 8], rax;
+
+        // Phase 3: stamp value_count = VS_RING_SLOTS(64) into spec_ptr[+16]
+        mov rax, 64;
+        mov [rdi + 16], rax;
+
+        // Phase 4: dispatch (rdi/rsi/rdx/rcx unchanged from entry)
+        call sparkline_draw;
+
+        // Phase 5: rax = sparkline_draw's return, restore stack, return
+        add rsp, 8;
+        ret;
+      }
+    }
+
+}

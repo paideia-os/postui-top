@@ -1,0 +1,362 @@
+// src/view_gauge.pdx -- postui-top.M2-002 (paideia-os/postui-top#3)
+//
+// ViewGauge module: two side-by-side postui Gauge widgets driven off
+// aggregate CPU / memory sums walked from the poll.pdx task_row array.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1 postui-top reference app, M2-002 slot)
+// =============================================================================
+//
+// M1-001 landed src/poll.pdx which fills an N-entry array of 48-byte
+// task_row records at every poll_tick. M2-001 (view_table.pdx) wires
+// that array into a postui Table draw. This landing adds a second
+// consumer of the same task_row array: an aggregate CPU% + memory
+// pair rendered as two `postui.Gauge` widgets side-by-side.
+//
+// The heart of the module is one per-frame walk over task_rows[]:
+//
+//     for i in 0..min(task_row_count, VG_MAX_ROWS):
+//         cpu_sum += task_rows[i].ticks_cpu
+//         mem_sum += task_rows[i].mem_kb
+//
+// followed by two gauge_draw calls -- one against a static CPU
+// GaugeSpec, one against a static MEM GaugeSpec -- each configured to
+// paint into one half of the caller-provided cell buffer rect.
+//
+// =============================================================================
+// CPU% APPROXIMATION (v1 documented shortcut)
+// =============================================================================
+//
+// The postui-top#3 issue text acknowledges the v1 shortcut directly:
+//
+//     "cpu_pct = cpu_sum * 100 / cpu_total_ticks (or use fixed max like
+//      100). Simpler v1: use cpu_sum itself modulo 100 as value;
+//      document."
+//
+// ticks_cpu is a per-task CUMULATIVE 100 Hz LAPIC tick counter
+// (paideia-os src/kernel/core/sched/task_info.pdx §Record layout), so
+// cpu_sum is the total CPU time consumed by every live task since
+// boot -- a monotonically-rising number that does NOT map to "current
+// CPU utilization %". The v1 gauge therefore paints
+// `cpu_sum % 100` (0..99) with a fixed max=100, producing a bar that
+// scrolls its fill level as the sum rises -- semantically an "activity
+// indicator" rather than a true percentage.
+//
+// The clean fix (see M2-003 hardening deferred item) is a two-tick
+// delta: cache last-frame's cpu_sum, compute `delta = current -
+// prev`, and divide by (delta_wall_ticks * ncores). That requires a
+// prev_cpu_sum stash slot in PollState (or here in ViewGauge scratch),
+// plus a monotonic-wall-tick counter -- both are cheap additions but
+// deferred until sys_clock_read_ns's SC+ surface stabilises (a
+// `sys_get_tick_count` landing is on the M1-002 hardening list per
+// poll.pdx §Tick semantics). Swapping the formula touches VG_CPU_MAX
+// and the single `xor rdx, rdx; div rcx` idiom in Phase 2 below.
+//
+// =============================================================================
+// MEMORY GAUGE
+// =============================================================================
+//
+// mem_sum is the sum of task_row.mem_kb across every live task. The
+// scale chosen for the max is 1 GiB expressed in KiB (1_048_576) --
+// covers typical /bin/top RAM footprints of a small microkernel test
+// image while leaving the fill obvious (a 100 MiB total renders as
+// ~10% fill). The scale is a static constant here (VG_MEM_MAX_KB)
+// rather than a sysinfo-derived total-RAM value; the future landing
+// that wires sys_meminfo (deferred to postui-top.M2-003) touches this
+// constant plus one syscall wrapper.
+//
+// pre-PML4-walker: rss_pages is hard-coded 0 in task_info.pdx today
+// (see task_info.pdx §rss_pages), so poll.pdx transcodes mem_kb=0 for
+// every row and the memory gauge paints an empty bar at every frame.
+// This is a KERNEL-side stub, not a ViewGauge bug -- the moment the
+// paideia-os PML4-walker landing lands, this gauge lights up with no
+// changes here.
+//
+// =============================================================================
+// SIDE-BY-SIDE LAYOUT
+// =============================================================================
+//
+// The caller-supplied rect (implicit as `rows` and `cols` args) is
+// split down the middle:
+//
+//   Left  gauge (CPU%):   (x = 0,           y = 0, w = cols/2,           h = rows)
+//   Right gauge (MEM):    (x = cols/2,      y = 0, w = cols - cols/2,    h = rows)
+//
+// Splitting via `cols/2` handles odd column counts correctly: the
+// right half absorbs the extra column (right_w = cols - left_w). If
+// cols == 0 or cols == 1, gauge_draw sees a zero-width rect and
+// early-returns 0 with no cells written -- matches the block_draw /
+// scrollbar_draw defensive posture.
+//
+// A future landing (M3-002 Tabs) will confine the gauge pair to a
+// sub-rect; only the rect packing in Phase 3 / Phase 4 changes at
+// that point.
+//
+// =============================================================================
+// STATIC SCRATCH FOOTPRINT (BSS, zero-initialised at load)
+// =============================================================================
+//
+//   _vg_spec_cpu   [u8; 48]   Gauge::GAUGE_SPEC_BYTES
+//   _vg_spec_mem   [u8; 48]   Gauge::GAUGE_SPEC_BYTES
+//
+// Total = 96 bytes, all @align(8). Both specs are rewritten in place
+// at every view_gauge_render call (the rect field re-derives from
+// rows/cols so a SIGWINCH-driven resize is picked up naturally on the
+// next frame; the value field re-derives from cpu_pct / mem_sum).
+//
+// =============================================================================
+// ENTRY SIGNATURE
+// =============================================================================
+//
+//   view_gauge_render(poll_state_ptr, buffer_ptr, rows, cols) -> u64
+//
+//   rdi = poll_state_ptr    VA of a PollState populated by poll_init /
+//                           poll_tick (256 B at Poll::POLL_STATE_BYTES)
+//   rsi = buffer_ptr        VA of a `rows * cols` grid of 16-byte Cells
+//                           (postui/src/cell.pdx cell wire; buffer.pdx
+//                           allocates it)
+//   rdx = rows              terminal row count
+//   rcx = cols              terminal column count
+//   -> rax                  the SECOND gauge_draw's return verbatim
+//                           (both gauge_draw paths return 0 at v1 per
+//                           postui/src/widgets/gauge.pdx §GAU_ERR_BAND;
+//                           a hardening landing that adds gauge failure
+//                           modes will short-circuit on the first non-
+//                           zero return here)
+//
+// =============================================================================
+// SC+ / KERNEL EFFECT SURFACE
+// =============================================================================
+//
+// view_gauge_render issues NO syscalls itself. It reads through
+// poll_state_ptr (memory), reads task_rows[] (memory), writes into
+// the cell buffer (memory) via gauge_draw. Effect row `!{mem}` @{}
+// matches gauge_draw's own effect. No capability gate.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewGauge`), matches file
+//     basename view_gauge.pdx.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp/and fits imm32 (widest is 0xFFFF for the
+//     rect packing masks; sentinels are `mov`-only). VG_MEM_MAX_KB
+//     (0x100000 = 1_048_576) fits imm32 signed positive; loaded via
+//     `mov reg, imm` (compact 5-byte form).
+//   - No 2-op `imul reg, imm` anywhere. Row-stride advance walks the
+//     task_row cursor by add-48 rather than an imul; the CPU%
+//     percentage math uses a single `div rcx` (rcx = 100 via imm8).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (every compare loads through a scratch first).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `vg_*` per the postui-top fingerprint discipline. Substring
+//     "loop" avoided defensively (aggregate uses `vg_sum_top` /
+//     `vg_sum_done`).
+//   - r11 usage: view_gauge_render uses r11 as a per-store scratch
+//     across the spec-population phases. Every `lea rN, [rip + label]`
+//     emit through paideia-as clobbers r11 internally; those are the
+//     only ones in the body, and no value survives them (r11 is
+//     re-loaded on the next use). Same scratch discipline
+//     view_table.pdx documents at its Phase-1/Phase-2 lea sites.
+//   - SysV push/pop parity: 5-push callee-save prologue (rbx / r12 /
+//     r13 / r14 / r15 = 40 bytes) + `sub rsp, 32` (aligned) -> entry
+//     rsp%16==8, +40==0, +32==0 for every nested call (gauge_draw).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+
+module ViewGauge = structure {
+
+  // ==========================================================================
+  // Sizing / structural constants
+  // ==========================================================================
+  pub let VG_MAX_ROWS       : u64 = 64    // matches Poll::PL_MAX_ROWS
+  pub let VG_GAUGE_COUNT    : u64 = 2     // CPU + MEM
+
+  // ==========================================================================
+  // Gauge maxima (see §CPU% APPROXIMATION and §MEMORY GAUGE for the
+  // rationale). Both fit imm32 signed positive so paideia-as emits the
+  // compact 5-byte `mov r32, imm32` form.
+  // ==========================================================================
+  pub let VG_CPU_MAX        : u64 = 100
+  pub let VG_MEM_MAX_KB     : u64 = 1048576  // 1 GiB in KiB (0x100000)
+
+  // ==========================================================================
+  // Static scratch (mutable, .bss, zero-initialised at load).
+  // Two GaugeSpec records at Gauge::GAUGE_SPEC_BYTES=48 each.
+  // ==========================================================================
+  pub let mut _vg_spec_cpu : [u8; 48] = uninit @align(8)
+  pub let mut _vg_spec_mem : [u8; 48] = uninit @align(8)
+
+  // ==========================================================================
+  // view_gauge_render(poll_state_ptr, buffer_ptr, rows, cols) -> u64
+  //
+  // Per-frame aggregate + two Gauge draws. See module preamble
+  // §ADAPTER APPROACH for the algorithm and §ENTRY SIGNATURE for the
+  // ABI.
+  //
+  // Register plan (callee-save prologue, roles across phases):
+  //   rbx = poll_state_ptr    survives every phase
+  //   r12 = buffer_ptr        survives every phase
+  //   r13 = rows              survives every phase (packs into spec.rect.h)
+  //   r14 = cols              survives every phase (packs into spec.rect.w)
+  //   r15 = row iterator      Phase 1 aggregate cursor
+  //
+  // Stack layout (below the 5-push prologue, `sub rsp, 32`):
+  //   [rsp +  0..+  8)   cpu_pct           Phase 2 result, Phase 3 consumer
+  //   [rsp +  8..+ 16)   mem_sum           Phase 1 result, Phase 4 consumer
+  //   [rsp + 16..+ 32)   pad               keeps rsp % 16 == 0
+  //
+  // Label prefix `vg_` per postui-top fingerprint discipline; substring
+  // "loop" avoided defensively (uses `vg_sum_top` / `vg_sum_done` /
+  // `vg_count_ok` -- none contain "loop").
+  // ==========================================================================
+  pub let view_gauge_render : (u64, u64, u64, u64) -> u64 !{mem} @{} =
+    fn (poll_state_ptr: u64) (buffer_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M2-002 (postui-top#3): view_gauge_render aggregates CPU / memory sums across the poll.pdx task_row array and dispatches two side-by-side postui Gauge widgets. 5-push callee-save prologue (rbx=poll_state_ptr, r12=buffer_ptr, r13=rows, r14=cols, r15=idx) + sub rsp, 32 -- entry rsp%16==8, +40==0, +32==0 for every nested SysV call (gauge_draw). Phase 1 (aggregate): clamp row_count = min(poll_state.task_row_count, VG_MAX_ROWS=64) into r11 via cmp/jbe (imm8); r10 = row_cursor = task_rows_ptr from [rbx+0]; xor r8/r9 (cpu_sum=0, mem_sum=0); xor r15 (idx=0). Loop vg_sum_top: cmp r15, r11; jae vg_sum_done; mov rax, [r10 + POLL_ROW_OFF_TICKS_CPU=16]; add r8, rax (cpu_sum accumulator, unsigned wrap OK -- Phase 2 mods by 100 anyway); mov rax, [r10 + POLL_ROW_OFF_MEM_KB=24]; add r9, rax; add r10, POLL_ROW_BYTES=48 (imm8, row-cursor stride advance -- no imul); add r15, 1; jmp vg_sum_top. On loop exit r8=cpu_sum, r9=mem_sum. Phase 2 (cpu_pct): mov rax, r8; xor rdx, rdx; mov rcx, 100 (imm8); div rcx (unsigned rdx:rax / rcx -> rax=quotient, rdx=cpu_sum % 100 as v1 shortcut per §CPU% APPROXIMATION). Stash mov [rsp+0], rdx (cpu_pct) and mov [rsp+8], r9 (mem_sum) before dispatch since gauge_draw clobbers caller-save regs. Phase 3 (CPU gauge spec + dispatch): lea r9, [rip + _vg_spec_cpu]. Rect pack (left half: x=0, y=0, w=cols/2, h=rows): mov r10, r14; shr r10, 1 (left_w = cols/2, imm8); and r10, 0xFFFF (imm32); shl r10, 32 (imm8); mov r11, r13; and r11, 0xFFFF; shl r11, 48; or r10, r11; mov [r9 + GAUGE_OFF_RECT=0], r10. value = cpu_pct: mov rax, [rsp+0]; mov [r9 + GAUGE_OFF_VALUE=8], rax. max = VG_CPU_MAX=100: mov rax, 100; mov [r9 + GAUGE_OFF_MAX=16], rax. kind = GAUGE_KIND_BAR=0, style_filled=0, style_empty=0: xor rax, rax; mov [r9+24], rax; mov [r9+32], rax; mov [r9+40], rax. Dispatch: lea rdi, [rip + _vg_spec_cpu]; mov rsi, r12; mov rdx, r13; mov rcx, r14; call gauge_draw. Phase 4 (MEM gauge spec + dispatch): lea r9, [rip + _vg_spec_mem]. Rect pack (right half: x=left_w, y=0, w=cols-left_w, h=rows): mov r10, r14; shr r10, 1 (left_w); mov r11, r14; sub r11, r10 (right_w = cols - left_w); and r10, 0xFFFF (right_x = left_w in low 16); and r11, 0xFFFF (right_w); mov rax, r10; mov rcx, r11; shl rcx, 32; or rax, rcx; mov rcx, r13; and rcx, 0xFFFF; shl rcx, 48; or rax, rcx; mov [r9+0], rax. value = mem_sum: mov rax, [rsp+8]; mov [r9+8], rax. max = VG_MEM_MAX_KB=1_048_576 (0x100000, imm32): mov rax, 1048576; mov [r9+16], rax. kind = 0, style_filled = 0, style_empty = 0 (same xor + three stores). Dispatch: lea rdi, [rip + _vg_spec_mem]; mov rsi, r12; mov rdx, r13; mov rcx, r14; call gauge_draw. rax carries the SECOND gauge_draw's return verbatim (both are 0 at v1 per postui/src/widgets/gauge.pdx §GAU_ERR_BAND). Epilogue: add rsp, 32; 5-pop; ret. Encoder discipline: no `test` (all zero-checks via cmp reg, 0); no `and reg, imm64` (widest mask 0xFFFF); no 2-op `imul reg, imm` (row-cursor advances by add-48 rather than multiplying, and Phase 2 uses `div rcx` for the mod-100); no `mul` mnemonic; no `cmp reg, [mem]`. r11 discipline: r11 is used freely as a per-store scratch and is clobbered by every `lea rN, [rip + label]` emit (paideia-as internal); we never rely on r11 surviving across a lea. gauge_draw's own 5-push prologue preserves SysV callee-save (rbx/r12/r13/r14/r15) on every return path per postui/src/widgets/gauge.pdx L306-L532. Effect !{mem} @{} matches gauge_draw; this module issues no syscalls. Labels prefixed vg_ per postui-top fingerprint discipline (substring 'loop' avoided defensively).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+        push r14;
+        push r15;
+        sub  rsp, 32;
+
+        mov rbx, rdi;                              // poll_state_ptr
+        mov r12, rsi;                              // buffer_ptr
+        mov r13, rdx;                              // rows
+        mov r14, rcx;                              // cols
+
+        // ---- Phase 1: aggregate cpu_sum / mem_sum ---------------------------
+        // Clamp row_count = min(poll_state.task_row_count, VG_MAX_ROWS)
+        mov rax, [rbx + 8];                        // Poll::POLL_OFF_TASK_ROW_COUNT
+        cmp rax, 64;                               // VG_MAX_ROWS
+        jbe vg_count_ok;
+        mov rax, 64;
+      vg_count_ok:
+        mov r11, rax;                              // r11 = clamped_count
+
+        mov r10, [rbx + 0];                        // r10 = row_cursor = task_rows_ptr
+        xor r8,  r8;                               // r8  = cpu_sum
+        xor r9,  r9;                               // r9  = mem_sum
+        xor r15, r15;                              // r15 = idx = 0
+
+      vg_sum_top:
+        cmp r15, r11;
+        jae vg_sum_done;
+
+        // cpu_sum += task_row.ticks_cpu (POLL_ROW_OFF_TICKS_CPU=16)
+        mov rax, [r10 + 16];
+        add r8,  rax;
+
+        // mem_sum += task_row.mem_kb (POLL_ROW_OFF_MEM_KB=24)
+        mov rax, [r10 + 24];
+        add r9,  rax;
+
+        add r10, 48;                               // POLL_ROW_BYTES
+        add r15, 1;
+        jmp vg_sum_top;
+      vg_sum_done:
+
+        // ---- Phase 2: cpu_pct = cpu_sum % 100 -------------------------------
+        // (v1 shortcut per §CPU% APPROXIMATION -- documented in preamble.)
+        mov rax, r8;
+        xor rdx, rdx;
+        mov rcx, 100;
+        div rcx;                                   // rax=quotient, rdx=remainder
+        // Stash before dispatch (gauge_draw clobbers caller-save regs).
+        mov [rsp + 0], rdx;                        // cpu_pct
+        mov [rsp + 8], r9;                         // mem_sum
+
+        // ---- Phase 3: CPU GaugeSpec + gauge_draw ----------------------------
+        lea r9, [rip + _vg_spec_cpu];
+
+        // Rect pack: x=0, y=0, w=cols/2, h=rows
+        //           packed = 0 | 0<<16 | left_w<<32 | rows<<48
+        mov r10, r14;                              // cols
+        shr r10, 1;                                // left_w = cols/2
+        and r10, 0xFFFF;
+        shl r10, 32;                               // w << 32
+        mov r11, r13;                              // rows
+        and r11, 0xFFFF;
+        shl r11, 48;                               // h << 48
+        or  r10, r11;
+        mov [r9 + 0],  r10;                        // GAUGE_OFF_RECT
+
+        // value = cpu_pct
+        mov rax, [rsp + 0];
+        mov [r9 + 8],  rax;                        // GAUGE_OFF_VALUE
+
+        // max = 100
+        mov rax, 100;
+        mov [r9 + 16], rax;                        // GAUGE_OFF_MAX
+
+        // kind = GAUGE_KIND_BAR (0); style_filled = 0; style_empty = 0
+        xor rax, rax;
+        mov [r9 + 24], rax;                        // GAUGE_OFF_KIND
+        mov [r9 + 32], rax;                        // GAUGE_OFF_STYLE_FILLED
+        mov [r9 + 40], rax;                        // GAUGE_OFF_STYLE_EMPTY
+
+        // Dispatch: gauge_draw(_vg_spec_cpu, buffer_ptr, rows, cols)
+        lea rdi, [rip + _vg_spec_cpu];
+        mov rsi, r12;                              // buffer_ptr
+        mov rdx, r13;                              // rows
+        mov rcx, r14;                              // cols
+        call gauge_draw;
+
+        // ---- Phase 4: MEM GaugeSpec + gauge_draw ----------------------------
+        lea r9, [rip + _vg_spec_mem];
+
+        // Rect pack: x=left_w, y=0, w=cols-left_w, h=rows
+        //           packed = left_w | 0<<16 | right_w<<32 | rows<<48
+        mov r10, r14;                              // cols
+        shr r10, 1;                                // left_w = cols/2
+        mov r11, r14;                              // cols
+        sub r11, r10;                              // right_w = cols - left_w
+        and r10, 0xFFFF;                           // right_x = left_w (low 16)
+        and r11, 0xFFFF;                           // right_w
+        mov rax, r10;                              // x (low 16)
+        mov rcx, r11;
+        shl rcx, 32;                               // w << 32
+        or  rax, rcx;
+        mov rcx, r13;                              // rows
+        and rcx, 0xFFFF;
+        shl rcx, 48;                               // h << 48
+        or  rax, rcx;
+        mov [r9 + 0],  rax;                        // GAUGE_OFF_RECT
+
+        // value = mem_sum
+        mov rax, [rsp + 8];
+        mov [r9 + 8],  rax;                        // GAUGE_OFF_VALUE
+
+        // max = VG_MEM_MAX_KB (1 GiB in KiB = 1_048_576 = 0x100000)
+        mov rax, 1048576;
+        mov [r9 + 16], rax;                        // GAUGE_OFF_MAX
+
+        // kind = GAUGE_KIND_BAR (0); style_filled = 0; style_empty = 0
+        xor rax, rax;
+        mov [r9 + 24], rax;                        // GAUGE_OFF_KIND
+        mov [r9 + 32], rax;                        // GAUGE_OFF_STYLE_FILLED
+        mov [r9 + 40], rax;                        // GAUGE_OFF_STYLE_EMPTY
+
+        // Dispatch: gauge_draw(_vg_spec_mem, buffer_ptr, rows, cols)
+        lea rdi, [rip + _vg_spec_mem];
+        mov rsi, r12;                              // buffer_ptr
+        mov rdx, r13;                              // rows
+        mov rcx, r14;                              // cols
+        call gauge_draw;
+
+        // rax carries the second gauge_draw's return verbatim
+        add rsp, 32;
+        pop r15;
+        pop r14;
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+}

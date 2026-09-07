@@ -1,0 +1,396 @@
+// src/view_tabs.pdx -- postui-top.M3-002 (paideia-os/postui-top#5)
+//
+// ViewTabs module: 3-tab horizontal strip [All | User | Kernel]
+// gluing postui.M2-007 tabs_draw to a persistent selected-tab index.
+//
+// =============================================================================
+// SCOPE (postui/docs/design.md §3.1 postui-top reference app, M3-002 slot)
+// =============================================================================
+//
+// M3-002 lands the second widget of the postui-top top-level UI: a
+// horizontal tab bar that toggles the task-list view between three
+// filter modes. The rendered strip lives at the top of the terminal
+// (row 0, full width, height 1); the selected tab index is persisted
+// in a module-private one-slot BSS cell (_vt_tabs_state[0]) so that
+// a key-handler landing at M3-003+ can advance it via view_tabs_next()
+// between frames without any caller-side threading.
+//
+// The three tabs and their filter semantics:
+//
+//   index 0  "All"     every task the kernel returns via sys_taskinfo
+//   index 1  "User"    tasks in the user address-space band
+//                      (KIND_PROCESS-owned, PID >= 1)
+//   index 2  "Kernel"  kernel-thread tasks (PID 0 or KIND_KTHREAD)
+//
+// The filter *itself* is not applied at M3-002 -- this landing owns the
+// view-switch UI only; a downstream M3-003 landing will read
+// view_tabs_selected() from the poll_tick post-refresh loop to gate
+// which task_rows survive into the Table's render slot. Keeping the
+// selection state and the filter application in separate landings mirrors
+// the postui.M2-007 → postui.M2-008 split (widget draws first, dispatch
+// wiring second) and lets M3-002 land against the existing M2-001 Table
+// pipeline without a coordinated schema change.
+//
+// =============================================================================
+// DEPENDENCY (postui.M2-007 tabs_draw)
+// =============================================================================
+//
+// This module is a pure consumer of postui/src/widgets/tabs.pdx (shipped
+// at postui.M2-007, milestone M2 released with postui v1.0.0). The
+// TabsSpec wire format (56 bytes) is the sole cross-module contract:
+//
+//   [+ 0..+ 8)   rect            u64 packed (x, y, w, h)
+//   [+ 8..+16)   titles_ptr      u64 -> Span[] array (24 B per Span)
+//   [+16..+24)   tab_count       u64
+//   [+24..+32)   selected        u64
+//   [+32..+40)   divider         u64 packed 4-byte UTF-8 codepoint
+//                                (0 elects default U+2502 '|')
+//   [+40..+48)   style_active    u64 packed Style
+//   [+48..+56)   style_inactive  u64 packed Style
+//
+// tabs_draw signature (SysV):
+//   rdi = spec_ptr, rsi = buf_ptr, rdx = rows, rcx = cols -> rax
+//
+// The postui Text::Span wire (24 bytes, TEXT_SPAN_BYTES):
+//   [+ 0..+ 8)   ptr             u64 byte pointer
+//   [+ 8..+16)   byte_len        u64 byte length
+//   [+16..+24)   style           u64 packed Style (0 = default)
+//
+// Both wires are frozen at postui-v1.0.0; the constants in this module
+// are bit-for-bit mirrors and any wire evolution touches exactly this
+// file plus the widget body.
+//
+// =============================================================================
+// STATIC SCRATCH FOOTPRINT (BSS, zero-initialized at load)
+// =============================================================================
+//
+//   _vt_tabs_state    [u64; 1]     8 B   current tab index (0..2)
+//   _vtb_spans        [u8; 72]    72 B   3 Span records (24 B each)
+//   _vtb_spec         [u8; 56]    56 B   TabsSpec
+//   _vtb_lbl_all      [u8; 3]      3 B   "All"
+//   _vtb_lbl_user     [u8; 4]      4 B   "User"
+//   _vtb_lbl_kernel   [u8; 6]      6 B   "Kernel"
+//
+// Total = 8 + 72 + 56 + 3 + 4 + 6 = 149 bytes (< half of a 4 KiB page).
+//
+// _vt_tabs_state is the ONE piece of module state that survives across
+// frames; every other slab is re-stamped by view_tabs_render at each
+// call. The label byte arrays are read-only literals; their addresses
+// are stable across the module's lifetime so a single lea + store into
+// each Span.ptr slot per render is a safe alias (no copy needed).
+//
+// The `_vt_tabs_state` name honors the issue text exactly. It shares
+// the `_vt_` prefix with view_table.pdx's own scratch (`_vt_state`,
+// `_vt_cells`, etc.) but the suffix `_tabs_state` disambiguates
+// against view_table.pdx's `_vt_state` (TableState, 24 B) in the flat
+// paideia-as symbol namespace. Every other symbol in this module uses
+// the distinct `_vtb_*` prefix to keep the split unambiguous.
+//
+// =============================================================================
+// ENTRY SIGNATURES
+// =============================================================================
+//
+//   view_tabs_render(buf_ptr, rows, cols) -> u64
+//     rdi = buf_ptr          VA of a `rows * cols` grid of 16-byte Cells
+//     rsi = rows             terminal row count
+//     rdx = cols             terminal column count
+//     -> rax                 0 on success, or tabs_draw's return propagated
+//                            verbatim (TAB_ERR_BAND on defensive failure).
+//     Renders the tab strip at row 0, spanning all `cols` columns.
+//
+//   view_tabs_next() -> ()
+//     No args. Advances the selection: (_vt_tabs_state[0] + 1) mod 3.
+//     Wraps 2 -> 0.
+//
+//   view_tabs_selected() -> u64
+//     No args. Returns _vt_tabs_state[0] in rax. Callers gate their
+//     downstream task-row filter on this value.
+//
+// =============================================================================
+// SC+ / KERNEL EFFECT SURFACE
+// =============================================================================
+//
+// ViewTabs issues NO syscalls. view_tabs_render reads through _vt_tabs_state
+// / _vtb_spans / _vtb_spec / label bytes (memory), writes into the cell
+// buffer via tabs_draw (memory), and dispatches tabs_draw with all pointer
+// arguments in userspace. view_tabs_next and view_tabs_selected touch a
+// single 8-byte slot each. Effect row `!{mem}` @{} matches tabs_draw's
+// own effect. No capability gate.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`ViewTabs`), matches file
+//     basename view_tabs.pdx per manifest.pdxproj `module-basename-
+//     pascal` compliance flag.
+//   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
+//   - Every immediate in cmp / and fits imm32 (widest is 0xFFFF, the
+//     Rect field mask). No sentinel > 0x7FFFFFFF appears in any cmp/and.
+//   - No 2-op `imul reg, imm` anywhere; no imul used at all (this
+//     module has no per-row multiplication -- the 3 tabs and 1 spec
+//     are stamped at fixed offsets).
+//   - No `mul` mnemonic; no `and reg, imm64`; no `cmp reg, [mem]`
+//     (the mod-3 wrap in view_tabs_next loads through rax first).
+//   - `pub let` single-line declarations only (multiline `pub let
+//     ="..."` is a paideia-as pitfall).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) NEVER appear as label names; every label prefixed
+//     `vtb_*` per the postui-top fingerprint discipline. Substring
+//     "loop" avoided defensively.
+//   - r11 discipline: paideia-as's `lea rN, [rip + label]` internally
+//     clobbers r11. This module uses `lea r11, [rip + _vt_tabs_state]`
+//     in view_tabs_next / view_tabs_selected -- r11 IS the target, so
+//     the internal clobber is the wanted result. In view_tabs_render,
+//     r11 is a per-store scratch that never crosses a lea boundary.
+//   - Byte load shape: not used in this module (no strnlen scan; the
+//     tab labels are compile-time literals with known lengths).
+//   - SysV push/pop parity:
+//       * view_tabs_render: 3-push callee-save prologue (rbx / r12 /
+//         r13 = 24 bytes) -> entry rsp%16==8, +24 == 32 (rsp%16 == 0)
+//         for the nested tabs_draw call. No sub rsp; no stack slots
+//         needed (all state lives in BSS / registers).
+//       * view_tabs_next: pure leaf; no push/pop, no callee-save
+//         touched, no nested call.
+//       * view_tabs_selected: pure leaf; no push/pop, no callee-save
+//         touched, no nested call.
+//   - Cross-module call convention: bare `call tabs_draw` per the
+//     view_table.pdx precedent (`call table_draw`) -- paideia-as's
+//     flat symbol namespace resolves postui's exported symbols by
+//     name at link time.
+
+module ViewTabs = structure {
+
+  // ==========================================================================
+  // TabsSpec field offsets (mirror of postui/src/widgets/tabs.pdx
+  // TABS_OFF_* constants; frozen at postui-v1.0.0). Named locally so
+  // view_tabs_render never dereferences the postui symbols directly;
+  // any wire evolution updates postui's constants and, in lockstep,
+  // this mirror block.
+  // ==========================================================================
+  pub let VTB_TABS_SPEC_BYTES : u64 = 56
+
+  pub let VTB_TABS_OFF_RECT           : u64 = 0
+  pub let VTB_TABS_OFF_TITLES_PTR     : u64 = 8
+  pub let VTB_TABS_OFF_TAB_COUNT      : u64 = 16
+  pub let VTB_TABS_OFF_SELECTED       : u64 = 24
+  pub let VTB_TABS_OFF_DIVIDER        : u64 = 32
+  pub let VTB_TABS_OFF_STYLE_ACTIVE   : u64 = 40
+  pub let VTB_TABS_OFF_STYLE_INACTIVE : u64 = 48
+
+  // ==========================================================================
+  // Text::Span field offsets (mirror of postui/src/text.pdx
+  // TEXT_SPAN_OFF_* / TEXT_SPAN_BYTES). Same lockstep discipline.
+  // ==========================================================================
+  pub let VTB_SPAN_BYTES : u64 = 24
+
+  pub let VTB_SPAN_OFF_PTR      : u64 = 0
+  pub let VTB_SPAN_OFF_BYTE_LEN : u64 = 8
+  pub let VTB_SPAN_OFF_STYLE    : u64 = 16
+
+  // ==========================================================================
+  // Structural constants for this module's fixed 3-tab strip.
+  // ==========================================================================
+  pub let VTB_TAB_COUNT : u64 = 3
+  pub let VTB_TAB_ROW_H : u64 = 1    // strip height in cells (top row only)
+
+  // Selected-index bounds. view_tabs_next wraps ((sel + 1) < BOUND ? sel+1 : 0).
+  pub let VTB_TAB_MOD : u64 = 3
+
+  // ==========================================================================
+  // Tab label byte arrays. Lengths are hard-coded at each render-site
+  // Span-populate block so the emit path never re-reads a length
+  // constant (matches view_table.pdx's _vt_hdr_* discipline).
+  // ==========================================================================
+  pub let _vtb_lbl_all    : [u8; 3] = "All"
+  pub let _vtb_lbl_user   : [u8; 4] = "User"
+  pub let _vtb_lbl_kernel : [u8; 6] = "Kernel"
+
+  // ==========================================================================
+  // Static scratch (mutable, .bss, zero-initialized at load).
+  //
+  // _vt_tabs_state is the ONE cross-frame slot -- view_tabs_next mutates
+  // it, view_tabs_render / view_tabs_selected read it. _vtb_spans and
+  // _vtb_spec are re-stamped by view_tabs_render at each call and
+  // carry no state between frames; the module could theoretically
+  // build them on the stack, but keeping them in BSS keeps
+  // view_tabs_render's stack footprint at zero (no `sub rsp, N` needed).
+  // ==========================================================================
+  pub let mut _vt_tabs_state : [u64; 1] = uninit @align(8)
+  pub let mut _vtb_spans     : [u8; 72] = uninit @align(8)
+  pub let mut _vtb_spec      : [u8; 56] = uninit @align(8)
+
+  // ==========================================================================
+  // view_tabs_render(buf_ptr, rows, cols) -> u64
+  //
+  // Per-frame Tabs draw. Rebuilds the 3-Span titles array + TabsSpec
+  // from static labels + persisted selection, then dispatches
+  // postui.tabs_draw over the top row (y = 0, h = 1) of the caller's
+  // cell buffer.
+  //
+  // Register plan (3-push callee-save prologue, roles across phases):
+  //   rbx = buf_ptr    survives every phase; used as tabs_draw's rsi
+  //   r12 = rows       survives every phase; used as tabs_draw's rdx
+  //   r13 = cols       survives every phase; used as tabs_draw's rcx
+  //                    (also packs into spec.rect.w)
+  //
+  // Alignment: entry rsp%16 == 8; +24 (3 pushes) == 32 (rsp%16 == 0).
+  // Nested tabs_draw call is 16-byte-aligned without any `sub rsp`.
+  //
+  // Label prefix `vtb_` per postui-top fingerprint discipline. No
+  // branches or loops in the body -- straight-line stamping of 3 Spans
+  // + 7 TabsSpec fields + 1 tail call.
+  // ==========================================================================
+  pub let view_tabs_render : (u64, u64, u64) -> u64 !{mem} @{} =
+    fn (buf_ptr: u64) (rows: u64) (cols: u64) -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M3-002 (postui-top#5): view_tabs_render is the per-frame Tabs adapter. 3-push callee-save prologue (rbx=buf_ptr, r12=rows, r13=cols = 24 bytes) -- entry rsp%16==8, +24==0 for the single nested tabs_draw SysV call; no sub rsp / no stack slots needed (all state in BSS or callee-save regs). Phase 1 (Span stamps into _vt_spans): lea r10, [rip + _vtb_spans]; for each of 3 tabs stamp (ptr, byte_len, style=0) via `lea r11, [rip + _vtb_lbl_<name>]; mov [r10 + off_ptr], r11; mov rax, <literal_len>; mov [r10 + off_byte_len], rax; xor rax, rax; mov [r10 + off_style], rax`. The `lea r11, [rip + label]` result is the value we want (r11 IS the target), so paideia-as's internal r11-clobber-on-lea is the wanted behavior. Literal lengths (3 for \"All\", 4 for \"User\", 6 for \"Kernel\") all fit imm8. Phase 2 (TabsSpec stamp into _vtb_spec): lea r10, [rip + _vtb_spec]; (a) rect: pack (x=0, y=0, w=cols, h=1) as x | y<<16 | w<<32 | h<<48 -- mov r11, r13 (cols); and r11, 0xFFFF (imm32); shl r11, 32 (imm8); mov rax, 1; and rax, 0xFFFF (imm32, defensive); shl rax, 48 (imm8); or r11, rax; mov [r10 + 0], r11 (x=0, y=0 implicit -- entry cells [0..16) and [16..32) unset in the OR chain remain zero because r11 was constructed only from the shifted w and h bits). (b) titles_ptr: lea r11, [rip + _vtb_spans]; mov [r10 + 8], r11. (c) tab_count = 3: mov rax, 3; mov [r10 + 16], rax. (d) selected: lea r11, [rip + _vt_tabs_state]; mov rax, [r11 + 0]; mov [r10 + 24], rax. (Note: after the second `lea rN, [rip + ...]` r11's value was overwritten by the lea; here we assign the fresh lea result to r11, load through it once, then discard.) (e) divider = 0 (elects default U+2502 '|' via tabs_draw's fixup): xor rax, rax; mov [r10 + 32], rax. (f, g) style_active = 0, style_inactive = 0 (default black-on-white unstyled per Style module wire): mov [r10 + 40], rax; mov [r10 + 48], rax. Phase 3 (dispatch): lea rdi, [rip + _vtb_spec]; mov rsi, rbx (buf_ptr); mov rdx, r12 (rows); mov rcx, r13 (cols); call tabs_draw. rax carries tabs_draw's return verbatim (0 on OK; TAB_ERR_BAND at 0xFFFFEBCE on defensive failure -- movabs-only in tabs_draw). Epilogue: 3-pop; ret. Encoder discipline: no `test` (no zero-checks in this body); no `and reg, imm64` (widest mask 0xFFFF, imm32); no `imul` (no per-row multiplications -- the 3-tab strip stamps into fixed offsets); no `mul`; no `cmp reg, [mem]` (no compares at all in this body). Every immediate (0, 1, 3, 4, 6, 8, 16, 24, 32, 40, 48, 0xFFFF) fits imm32; every shift count (16, 32, 48) is imm8. r11 discipline: r11 is used as scratch across the body; every `lea r11, [rip + label]` places the wanted label address into r11 and the internal r11-clobber-on-lea is the exact behavior we depend on. NON-target `lea rN, [rip + ...]` (only two: `lea r10, [rip + _vtb_spans]` at phase 1 start and `lea r10, [rip + _vtb_spec]` at phase 2 start, plus `lea rdi, [rip + _vtb_spec]` at phase 3) clobber r11 but no value of r11 needs to survive those (the next r11 use is another lea into r11). Effect `!{mem}` (spec/span/label reads, spec/span stores, transitive tabs_draw cell writes). Labels prefixed vtb_ per postui-top fingerprint discipline (no labels needed for this straight-line body).",
+      block: {
+        push rbx;
+        push r12;
+        push r13;
+
+        mov rbx, rdi;                              // buf_ptr
+        mov r12, rsi;                              // rows
+        mov r13, rdx;                              // cols
+
+        // ---- Phase 1: Span stamps (3 tabs into _vtb_spans) ------------------
+        lea r10, [rip + _vtb_spans];
+
+        // Span 0: "All" (3 bytes)
+        lea r11, [rip + _vtb_lbl_all];
+        mov [r10 + 0],  r11;                       // span[0].ptr
+        mov rax, 3;
+        mov [r10 + 8],  rax;                       // span[0].byte_len
+        xor rax, rax;
+        mov [r10 + 16], rax;                       // span[0].style = 0
+
+        // Span 1: "User" (4 bytes)
+        lea r11, [rip + _vtb_lbl_user];
+        mov [r10 + 24], r11;                       // span[1].ptr
+        mov rax, 4;
+        mov [r10 + 32], rax;                       // span[1].byte_len
+        xor rax, rax;
+        mov [r10 + 40], rax;                       // span[1].style = 0
+
+        // Span 2: "Kernel" (6 bytes)
+        lea r11, [rip + _vtb_lbl_kernel];
+        mov [r10 + 48], r11;                       // span[2].ptr
+        mov rax, 6;
+        mov [r10 + 56], rax;                       // span[2].byte_len
+        xor rax, rax;
+        mov [r10 + 64], rax;                       // span[2].style = 0
+
+        // ---- Phase 2: TabsSpec stamp into _vtb_spec -------------------------
+        lea r10, [rip + _vtb_spec];
+
+        // (a) rect: (x=0, y=0, w=cols, h=1)  packed as x | y<<16 | w<<32 | h<<48
+        mov r11, r13;                              // cols
+        and r11, 0xFFFF;
+        shl r11, 32;                               // w << 32
+        mov rax, 1;
+        and rax, 0xFFFF;
+        shl rax, 48;                               // h << 48
+        or  r11, rax;                              // x=0, y=0 implicit
+        mov [r10 + 0], r11;                        // VTB_TABS_OFF_RECT
+
+        // (b) titles_ptr
+        lea r11, [rip + _vtb_spans];
+        mov [r10 + 8], r11;                        // VTB_TABS_OFF_TITLES_PTR
+
+        // (c) tab_count = 3
+        mov rax, 3;
+        mov [r10 + 16], rax;                       // VTB_TABS_OFF_TAB_COUNT
+
+        // (d) selected = _vt_tabs_state[0]
+        lea r11, [rip + _vt_tabs_state];
+        mov rax, [r11 + 0];
+        mov [r10 + 24], rax;                       // VTB_TABS_OFF_SELECTED
+
+        // (e) divider = 0 (elects default U+2502 '|' via tabs_draw fixup)
+        xor rax, rax;
+        mov [r10 + 32], rax;                       // VTB_TABS_OFF_DIVIDER
+
+        // (f) style_active = 0 (default)
+        mov [r10 + 40], rax;                       // VTB_TABS_OFF_STYLE_ACTIVE
+
+        // (g) style_inactive = 0 (default)
+        mov [r10 + 48], rax;                       // VTB_TABS_OFF_STYLE_INACTIVE
+
+        // ---- Phase 3: dispatch tabs_draw ------------------------------------
+        lea rdi, [rip + _vtb_spec];
+        mov rsi, rbx;                              // buf_ptr
+        mov rdx, r12;                              // rows
+        mov rcx, r13;                              // cols
+        call tabs_draw;
+
+        // rax carries tabs_draw's return verbatim
+        pop r13;
+        pop r12;
+        pop rbx;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // view_tabs_next() -> ()
+  //
+  // Advance the selected-tab index: sel = (sel + 1) mod 3. Wraps 2 -> 0.
+  //
+  // Contract:
+  //   No args.
+  //   -> rax                 undefined (void; caller must not rely on it)
+  //
+  // Register plan: pure leaf. r11 = _vt_tabs_state address (the `lea r11,
+  // [rip + label]` result IS the wanted value, so paideia-as's internal
+  // r11-clobber-on-lea is the wanted behavior). rax = working sel value.
+  // No pushes, no nested call.
+  //
+  // Labels prefixed vtb_ per postui-top fingerprint discipline.
+  // ==========================================================================
+  pub let view_tabs_next : () -> () !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M3-002 (postui-top#5): view_tabs_next advances the persistent tab selection by one mod 3. Pure leaf: no push/pop, no callee-save touched, no nested call. Body: lea r11, [rip + _vt_tabs_state] (r11 IS the target of the lea; the paideia-as internal r11-clobber-on-lea is the wanted result); mov rax, [r11 + 0] (current sel); add rax, 1; cmp rax, 3 (imm8 -- VTB_TAB_MOD); jb vtb_next_store (unsigned below-3 => in range); xor rax, rax (wrap 3 -> 0). vtb_next_store: mov [r11 + 0], rax. ret. Encoder discipline: no `test` (zero-check via cmp reg, 3 wraps at the boundary rather than a separate cmp reg, 0); no imul; no `and reg, imm`; no `cmp reg, [mem]` (the compare loads through rax first). Every immediate (0, 1, 3) fits imm8. Effect `!{mem}` (one load + one store on _vt_tabs_state). Labels prefixed vtb_ per fingerprint discipline. Return type () -- rax on return is 0 in the wrap path or the wrapped sel in the non-wrap path; caller must not rely on rax content (void).",
+      block: {
+        lea r11, [rip + _vt_tabs_state];
+        mov rax, [r11 + 0];
+        add rax, 1;
+        cmp rax, 3;
+        jb vtb_next_store;
+        xor rax, rax;
+      vtb_next_store:
+        mov [r11 + 0], rax;
+        ret;
+      }
+    }
+
+  // ==========================================================================
+  // view_tabs_selected() -> u64
+  //
+  // Return the currently-selected tab index (0, 1, or 2).
+  //
+  // Contract:
+  //   No args.
+  //   -> rax                 _vt_tabs_state[0]  (0..2 under this module's
+  //                          invariants; 0 pre-first view_tabs_next call
+  //                          because _vt_tabs_state is BSS-zero on load)
+  //
+  // Register plan: pure leaf. r11 = _vt_tabs_state address (see
+  // view_tabs_next for the r11-clobber-on-lea rationale). No pushes,
+  // no nested call.
+  //
+  // No labels (straight-line, one branch-free path).
+  // ==========================================================================
+  pub let view_tabs_selected : () -> u64 !{mem} @{} =
+    fn () -> unsafe {
+      effects: {mem}, capabilities: {},
+      justification: "postui-top.M3-002 (postui-top#5): view_tabs_selected returns the persistent tab selection. Pure leaf: no push/pop, no callee-save touched, no nested call. Body: lea r11, [rip + _vt_tabs_state] (r11 IS the lea target; paideia-as internal r11-clobber is the wanted result); mov rax, [r11 + 0]; ret. Encoder discipline: no `test`, no imul, no `and reg, imm`, no `cmp reg, [mem]`, no branches. No immediates other than the +0 memory displacement (imm8). Effect `!{mem}` (one load from _vt_tabs_state). No labels (straight-line).",
+      block: {
+        lea r11, [rip + _vt_tabs_state];
+        mov rax, [r11 + 0];
+        ret;
+      }
+    }
+
+}
