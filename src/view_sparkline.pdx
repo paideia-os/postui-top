@@ -445,10 +445,18 @@ module ViewSparkline = structure {
         // full value_count (because Rect.w = cols and value_count is
         // capped at cols), rendering the newest cols samples.
         // ================================================================
-        mov r8, rcx;                               // r8 = cols
-        cmp r8, 64;                                // cols vs VS_RING_SLOTS
+        // Clamp basis is Rect.w (from spec[0]), NOT the SysV `cols`
+        // stride arg — sparkline_draw itself bounds visible_cols by bw
+        // decoded from Rect, not by cols (postui/src/widgets/sparkline.pdx
+        // §DRAW BODY). Using cols here would silently re-introduce the
+        // #8 stale-display defect for any future caller that passes a
+        // sub-rect narrower than the full canvas.
+        mov r8, [rdi + 0];                         // r8 = packed rect
+        shr r8, 32;                                // r8 = rect >> 32 (w|h)
+        and r8, 0xFFFF;                            // r8 = Rect.w (bw)
+        cmp r8, 64;                                // Rect.w vs VS_RING_SLOTS
         jbe vs_have_min;
-        mov r8, 64;                                // r8 = min(cols, 64)
+        mov r8, 64;                                // r8 = min(Rect.w, 64)
       vs_have_min:
 
         // scratch tail-offset in bytes = (VS_RING_SLOTS - value_count) * VS_SLOT_BYTES
