@@ -50,7 +50,9 @@ caps_decl   = caps.decl
 sources:
   - src/poll.pdx                  # M1-001: PollState + poll_init + poll_tick sys_taskinfo consumer
   - src/view_table.pdx            # M2-001: ViewTable adapter -- postui Table draw wired to poll.pdx task_rows
-  - src/view_tabs.pdx             # M3-002 (this issue): ViewTabs -- 3-tab [All|User|Kernel] view switch wired to postui Tabs
+  - src/view_gauge.pdx            # M3-001: ViewGauge -- 2x BAR gauge (CPU + memory activity)
+  - src/view_sparkline.pdx        # M3-001b: ViewSparkline -- 64-slot ring history
+  - src/view_tabs.pdx             # M3-002: ViewTabs -- 3-tab [All|User|Kernel] view switch wired to postui Tabs
 
 # --- Library dependencies -----------------------------------------------
 # postui (the widget library at ../postui, v1.0.0 shipped at
