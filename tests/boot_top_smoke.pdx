@@ -1,0 +1,103 @@
+// tests/boot_top_smoke.pdx -- postui-top.M4-002 (paideia-os/postui-top#7)
+//
+// BootTopSmoke: placeholder release-witness for the postui-top v1.0.0
+// release closer. At v1.0.0 this test's role is to prove that the
+// tests/ directory is picked up by tools/build.sh's `if [ -d tests ]`
+// loop and that a `module BootTopSmoke = structure { ... }` file
+// compiles cleanly under the paideia-as toolchain floor declared in
+// manifest.pdxproj (>= 0.34.0). No behavior is exercised here; the
+// entrypoint returns 0 unconditionally.
+//
+// =============================================================================
+// WHY A PLACEHOLDER AND NOT A REAL FIXTURE-BACKED SMOKE
+// =============================================================================
+//
+// The M4-002 release closer's fixture-backed smoke (widget-catalog
+// render + TaskRow@0.1 round-trip against a fake ring) requires two
+// prerequisites that are OUT OF SCOPE for this landing:
+//
+//   1. A userspace-visible KIND_TUI_CANVAS mock -- postui.M1-008's
+//      boot_block_smoke drives block_draw against a raw buffer (no
+//      canvas cap), but a top(1)-style smoke wants to observe the
+//      view-stack's cell output through the same present() path a
+//      live consumer would use. The mockable canvas surface is
+//      tracked as postui#M5-testing (out of tree at v1.0.0).
+//
+//   2. A live sysno 115 (sys_semantic_send) return the userspace
+//      caller can round-trip against. paideia-os#2352 lands the
+//      kernel body; until then every semantic_emit_task_rows call
+//      returns -ENOSYS (0xFFFFFFFFFFFFFFDA) as the DOCUMENTED v1.0.0
+//      shape (see README.md §Status), which is not a signal the
+//      release smoke can pin against without special-casing
+//      -ENOSYS as a pass -- a shape the M4-003 refresh should
+//      handle rather than the release closer.
+//
+// This placeholder file ships instead so:
+//
+//   - The manifest.pdxproj `tests:` block has a real target that
+//     compiles under tools/build.sh (otherwise the M4-003 landing
+//     would have to introduce both the tests/ directory AND its
+//     first source in one round).
+//   - Downstream consumers reading `sources: [tests/...]` see the
+//     shape the M4-003 refresh will inhabit (module BootTopSmoke,
+//     nullary entry, u64 return, `bts_` label prefix).
+//   - Fail-code family band 0xFFFFECE0..0xFFFFECEF is reserved via
+//     the manifest comment even though no sentinel is raised here;
+//     M4-003 adds the mismatch sentinels within that band.
+//
+// =============================================================================
+// PAIDEIA-AS CONFORMANCE
+// =============================================================================
+//
+//   - Module name PascalCase basename (`BootTopSmoke`), matches file
+//     basename `boot_top_smoke.pdx` (module-basename-pascal).
+//   - No `test` mnemonic (no zero-check needed in the placeholder body).
+//   - No imm64 in cmp/and (no compares at all in the placeholder body).
+//   - No `imul reg, imm`, no `and reg, imm64`, no `mul` mnemonic.
+//   - Single-line `pub let` declarations only.
+//   - Labels prefixed `bts_` per fingerprint discipline (no labels in
+//     the placeholder body, but the prefix is reserved for M4-003).
+//   - Reserved paideia-as keywords (`loop`, `if`, `then`, `else`,
+//     `test`) never appear as labels.
+//   - Effect row `!{} @{}` -- no memory access, no syscall, no cap.
+//     The body is a two-instruction leaf (xor rax, rax; ret) with no
+//     stack frame, so SysV rsp%16==8-on-entry discipline is
+//     preserved trivially (no push/pop, no nested call).
+
+module BootTopSmoke = structure {
+
+  // ==========================================================================
+  // Fail-code family band reservation (0xFFFFECE0..0xFFFFECEF per this
+  // repo's design plan). No sentinel is RAISED at M4-002; M4-003 adds
+  // the mismatch sentinels within this band as the fixture-backed
+  // smoke lands.
+  //
+  // A single documentary constant is exported so a downstream reader
+  // can identify the band without a comment-only reference.
+  // ==========================================================================
+  pub let BTS_ERR_BAND_BASE : u64 = 0xFFFFECE0
+
+  // ==========================================================================
+  // boot_top_smoke_main() -> u64
+  //
+  // Placeholder witness for the postui-top v1.0.0 release closer.
+  // Returns 0 unconditionally; no state is touched, no syscall is
+  // issued, no widget is rendered. The M4-003 refresh replaces this
+  // body with the fixture-backed smoke described in the file header.
+  //
+  // Register plan: nullary entry, leaf, no push/pop, no nested call.
+  // SysV rsp%16==8 on entry is preserved by construction (the body
+  // is `xor rax, rax; ret` -- no stack traffic).
+  // ==========================================================================
+  pub let boot_top_smoke_main : () -> u64 !{} @{} =
+    fn () -> unsafe {
+      effects: {},
+      capabilities: {},
+      justification: "postui-top.M4-002 (postui-top#7): placeholder release witness for the v1.0.0 release closer. Returns 0 unconditionally. The fixture-backed smoke (widget-catalog render + TaskRow@0.1 round-trip) is out of scope at v1.0.0 -- it requires (a) a userspace-visible KIND_TUI_CANVAS mock (tracked as postui#M5-testing) and (b) a live sysno 115 kernel body (tracked as paideia-os#2352). This placeholder ships so the manifest.pdxproj `tests:` block has a real target that compiles under tools/build.sh's `if [ -d tests ]` loop and so the M4-003 refresh has an existing file to edit rather than introduce. Body is a two-instruction leaf (xor rax, rax; ret) with no stack frame; SysV rsp%16==8 on entry is preserved by construction. Effect row !{} @{} -- no memory access, no syscall, no cap. No `test` mnemonic (no zero-check); no imm64 in cmp/and (no compares); no imul; no `and reg, imm64`; no `mul`. Single-line pub let for the band-base documentary constant. Fail-code family band 0xFFFFECE0..0xFFFFECEF reserved via the manifest comment; sentinels enumerated in M4-003.",
+      block: {
+        xor rax, rax;
+        ret
+      }
+    }
+
+}

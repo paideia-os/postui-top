@@ -31,7 +31,7 @@
 # same monorepo-satellite pattern.
 
 name        = postui-top
-version     = 0.1.0-pre
+version     = 1.0.0
 kind        = tool
 # entry lands at M1-005 (_start binder + main render loop). At M1-001
 # there is no _start; the loose-object build via tools/build.sh
@@ -72,8 +72,10 @@ deps:
 # Fail-code family bands for postui-top per this repo's design plan
 # (see design/architecture.md when it lands at M1-002):
 #   test_poll_tick_fingerprint          0xFFFFECF0..0xFFFFECFF   (M1-004)
+#   test_boot_top_smoke                 0xFFFFECE0..0xFFFFECEF   (M4-002)
 tests:
-  # (empty at M1-001; M1-004 adds tests/test_poll_tick_fingerprint.pdx)
+  - tests/boot_top_smoke.pdx      # M4-002: placeholder witness (returns 0 pending
+                                  #         paideia-os#2352 sysno 115 kernel body)
 
 # --- Documentation targets ---------------------------------------------
 # .pdxdoc file(s) shipped at M4 packaging time.
@@ -92,10 +94,18 @@ compliance:
   - byte-load-zero-then-mov_b     # xor rax, rax; mov_b rax, [ptr]
   - sysv-push-pop-parity          # rsp % 16 == 0 at every nested call
 
-# --- Release policy (M4-004+) ------------------------------------------
-# Dual-signed release mirroring postui / shell shape. Populated at M4
-# closing; fields below are forward-declared so the M4-004 landing does
-# not need to introduce them.
+# --- Release policy (M4-002) -------------------------------------------
+# Dual-signed release mirroring postui / shell shape. Landed at M4-002
+# (postui-top v1.0.0 release closer). ML-DSA-65 is the primary post-
+# quantum signer; Ed25519 rides as a secondary classical signer per the
+# same dual-sign policy postui.M5-003 and shell.M5-001 established.
+# `pkg install postui-top` requires BOTH signatures to verify.
+#
+# NOTE (paideia-os#2352): the semantic-pipe consumer path (SC+ sysno 115
+# / sys_semantic_send) is compiled + linked but returns -ENOSYS at
+# runtime pending the kernel-side landing. This is a documented v1.0.0
+# behavior (the userspace scaffolding is complete; kernel routing is
+# tracked cross-repo) and does NOT gate release — see README.md §Status.
 release:
   signer_author: snunez+postui-top-author@paideia-os.dev
   signer_root:   paideia-os-release-root@paideia-os.dev
