@@ -76,9 +76,11 @@
 //     poll.pdx.
 //   - No `test` mnemonic; every zero-check goes through `cmp reg, 0`.
 //   - Every immediate in cmp / and fits imm32 (<= 0x7FFFFFFF). Large
-//     sentinels (0xFFFFEC0x band) are only used in `mov reg, imm`
-//     form -- paideia-as emits the 10-byte movabs encoding for
-//     imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
+//     sentinels (0xFFFFE00x band -- relocated off the colliding
+//     0xFFFFEC0x KIND_ELEVATE_CHANNEL band by the debugger audit
+//     fixup; see the error-band comment below) are only used in
+//     `mov reg, imm` form -- paideia-as emits the 10-byte movabs
+//     encoding for imm > 0x7FFFFFFF, legal for mov but NOT for cmp/and.
 //   - No 2-op `imul reg, imm` anywhere; no imul used at all. Every
 //     multiplication in the loop uses `shl reg, N` (row-size 48
 //     factors: mul-by-48 = shl 4 + add + shl 1, but we use a plain
@@ -105,14 +107,45 @@ module Poll = structure {
   // ==========================================================================
   // Error band (postui-top's wave-scoped high-nibble discriminator).
   //
-  // The M1-001 issue reserves 0xFFFFEC00..0xFFFFEC0F for postui-top;
-  // this band is disjoint from postui's own 0xFFFFEB80..0xFFFFEB8F
-  // library band (see postui/src/lib.pdx POSTUI_ERR_BAND_BASE) and
-  // from every kernel-side band the postui pipeline touches
-  // (KIND_TUI_CANVAS 0xFFFFEB10..1F, KIND_TTY 0xFFFFEB20..2F,
-  // KIND_SIG_KEY 0xFFFFEB00..0F). A downstream consumer can `shr
-  // rax, 4` and switch on the band nibble to attribute a refusal
-  // to postui-top vs postui vs the kernel.
+  // DEBUGGER AUDIT FIXUP (postui-top#1 M1-001, 2026-09-07): the
+  // landed version of this file reserved 0xFFFFEC00..0xFFFFEC0F for
+  // postui-top. That band is NOT free -- it is the kernel's own
+  // KIND_ELEVATE_CHANNEL failure taxonomy, landed at
+  // src/kernel/core/cap/kind_elevate_channel.pdx SECTION 3 ("FAILURE
+  // TAXONOMY -- 0xFFFFEC00..0xFFFFEC0F") and confirmed as the sole
+  // owner of that band by paideia-os's authoritative kind-ordinal +
+  // failure-band registry (design/architecture/next-wave-derived-
+  // kinds.md: `0x191 | KIND_ELEVATE_CHANNEL | ... | 0xFFFFEC00..0F`)
+  // and independently by two more kernel files stating the entire
+  // 0xFFFFEC00..0xFFFFECFF page is band-claimed end to end
+  // (kind_sig_key.pdx SECTION 3, kind_volume.pdx SECTION 3). Live
+  // sentinels already occupy exactly the sub-range this file's own
+  // "+4..+F reserved for M1-002+" comment planned to grow into
+  // (ELVC_REVOKE_ALREADY=0xFFFFEC06 through ELVC_TAIL_ENOSPC=
+  // 0xFFFFEC0F) -- populating them per the original plan would have
+  // produced byte-for-byte collisions with live kernel return codes.
+  // The prior comment's own disjointness claim never checked this:
+  // it verified only the EB-page kernel bands, then picked an
+  // EC-page address without auditing the EC page at all. That
+  // comment's KIND_TTY citation was also wrong -- KIND_TTY's real
+  // band is 0xFFFFEC30..0xFFFFEC3F (kind_tty.pdx SECTION 3,
+  // TTY_TAIL_ENOSPC=0xFFFFEC3F etc.); 0xFFFFEB20..0xFFFFEB2F actually
+  // belongs to KIND_TLS_TRUST (..27) + KIND_NIC (28..2F).
+  //
+  // FIX: relocated postui-top's band to 0xFFFFE000..0xFFFFE00F.
+  // Verified via `grep -rn "0xFFFFE0[0-9A-F][0-9A-F]"` across the
+  // entire paideia-os monorepo (src/, design/, tools/, tests/, doc/)
+  // and the postui-work sibling repos (postui, postui-dmesg,
+  // postui-hex): zero hits anywhere in the full 0xFFFFE000..
+  // 0xFFFFE0FF page (16 sixteen-wide bands), so this landing claims
+  // only the first band and leaves 0xFFFFE010..0xFFFFE0FF free
+  // headroom for postui-top's own M1-002+ growth without repeating
+  // this mistake. This band is disjoint from postui's own
+  // 0xFFFFEB80..0xFFFFEB8F library band (see postui/src/lib.pdx
+  // POSTUI_ERR_BAND_BASE) and from every kernel-side band audited
+  // above. A downstream consumer can `shr rax, 4` and switch on the
+  // band nibble to attribute a refusal to postui-top vs postui vs
+  // the kernel.
   //
   // Sentinels within the postui-top band are allocated bottom-up:
   //   +0  PL_ERR_BAD_STATE_PTR      poll_init/tick with a null state
@@ -129,13 +162,13 @@ module Poll = structure {
   // to introduce them.
   // ==========================================================================
   pub let POSTUI_TOP_OK                : u64 = 0
-  pub let POSTUI_TOP_ERR_BAND_BASE     : u64 = 0xFFFFEC00
-  pub let POSTUI_TOP_ERR_BAND_TOP      : u64 = 0xFFFFEC0F
+  pub let POSTUI_TOP_ERR_BAND_BASE     : u64 = 0xFFFFE000
+  pub let POSTUI_TOP_ERR_BAND_TOP      : u64 = 0xFFFFE00F
 
-  pub let PL_ERR_BAD_STATE_PTR         : u64 = 0xFFFFEC00
-  pub let PL_ERR_BAD_ROWS_PTR          : u64 = 0xFFFFEC01
-  pub let PL_ERR_BAD_ROW_CAP           : u64 = 0xFFFFEC02
-  pub let PL_ERR_INTERVAL_ZERO         : u64 = 0xFFFFEC03
+  pub let PL_ERR_BAD_STATE_PTR         : u64 = 0xFFFFE000
+  pub let PL_ERR_BAD_ROWS_PTR          : u64 = 0xFFFFE001
+  pub let PL_ERR_BAD_ROW_CAP           : u64 = 0xFFFFE002
+  pub let PL_ERR_INTERVAL_ZERO         : u64 = 0xFFFFE003
 
   // ==========================================================================
   // Kernel-side sys_taskinfo error sentinels (mirror src/kernel/core/
@@ -166,7 +199,14 @@ module Poll = structure {
   //   [+40..+255] reserved                 216 bytes of growth room
   //                                        (SIGWINCH counter, per-slot
   //                                        latency histogram, refresh-
-  //                                        error counters at M1-002+)
+  //                                        error counters at M1-002+);
+  //                                        zeroed by poll_init (see
+  //                                        debugger audit fixup below)
+  //                                        so an M1-002+ reader can
+  //                                        trust an unset field reads
+  //                                        as 0 without requiring every
+  //                                        caller to pre-zero the
+  //                                        struct itself
   //
   // Chosen at 256 bytes rather than a tighter 64 so the M2-M4 landings
   // grow into the reserved region without another struct-resize churn;
@@ -329,12 +369,14 @@ module Poll = structure {
   // poll_init(state_ptr, rows_ptr, row_cap, interval_ticks) -> u64
   //
   // Initialize a PollState struct in caller-provided memory. Writes
-  // every non-reserved field; the reserved region (+40..+255) is left
-  // as-is (caller is expected to zero the struct before the first
-  // poll_init if the growth region matters). last_poll_tick is
-  // explicitly zeroed so the first poll_tick always fires the refresh
-  // path (0 + any positive interval is trivially "elapsed" against
-  // any positive current tick).
+  // every non-reserved field, then zeroes the reserved region
+  // (+40..+255) too (DEBUGGER AUDIT FIXUP, postui-top#1 M1-001: the
+  // landed version left +40..+255 untouched and required the caller
+  // to pre-zero the struct itself if the growth region mattered --
+  // a latent footgun for any M1-002+ reader that trusts an unset
+  // reserved field to read as 0). last_poll_tick is explicitly
+  // zeroed so poll_tick's own last_poll_tick==0 special case (see
+  // poll_tick's Phase A) forces its first call to always refresh.
   //
   // Contract:
   //   rdi = state_ptr         VA of a >=256B struct
@@ -346,14 +388,17 @@ module Poll = structure {
   //
   // Register plan: zero pushes needed (no nested calls). All work is
   // register-immediate stores through rdi. rsi/rdx/rcx are read once
-  // each into the destination struct; no scratch registers needed.
+  // each into the destination struct; once stored, rdx/rcx are reused
+  // as scratch for the reserved-region zero loop (rax already holds
+  // the 0 fill value from the task_row_count store).
   //
-  // Labels: none (linear body, no branches).
+  // Labels: pl_init_zero_scan / pl_init_zero_end (reserved-region
+  // zero loop only; the field-stamp prefix remains linear/branch-free).
   // ==========================================================================
   pub let poll_init : (u64, u64, u64, u64) -> u64 !{mem} @{} =
     fn (state_ptr: u64) (rows_ptr: u64) (row_cap: u64) (interval_ticks: u64) -> unsafe {
       effects: {mem}, capabilities: {},
-      justification: "postui-top.M1-001 (postui-top#1): PollState field-stamp initializer. Contract SysV rdi=state_ptr, rsi=rows_ptr, rdx=row_cap, rcx=interval_ticks. Body writes six u64 slots through rdi: [+0]=rsi (task_rows_ptr), [+8]=0 (task_row_count -- xor rax,rax; mov [rdi+8], rax), [+16]=rdx (task_row_cap), [+24]=rcx (poll_interval_ticks), [+32]=0 (last_poll_tick -- reuses the zeroed rax; store STRICTLY BEFORE the return so a partial-init leaves last_poll_tick at whatever the caller pre-zeroed). Reserved region [+40..+255] left as-is (caller-owned pre-init). Return xor rax, rax (0=OK). No validation at this landing -- caller bugs (null state_ptr, row_cap==0) surface as segfaults or wrong-row data; the PL_ERR_* sentinels reserved above land defensive gates at M1-002. Zero pushes / pops -- no callee-save touched, no nested call. rdi/rsi/rdx/rcx are all SysV caller-save. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem]. Every field offset (+0/+8/+16/+24/+32) fits imm8. Leaf.",
+      justification: "postui-top.M1-001 (postui-top#1): PollState field-stamp initializer. Contract SysV rdi=state_ptr, rsi=rows_ptr, rdx=row_cap, rcx=interval_ticks. Body writes six u64 slots through rdi: [+0]=rsi (task_rows_ptr), [+8]=0 (task_row_count -- xor rax,rax; mov [rdi+8], rax), [+16]=rdx (task_row_cap), [+24]=rcx (poll_interval_ticks), [+32]=0 (last_poll_tick -- reuses the zeroed rax). DEBUGGER AUDIT FIXUP (2026-09-07): the reserved region [+40..+255] is now also zeroed via a small scan loop (rcx=cursor starting at 40, incrementing by 8; rdx=lea-computed scratch pointer rdi+rcx per-iteration, matching poll_tick's own lea-then-fixed-offset-store idiom rather than a bare [reg+reg] mov operand; loop exits via `cmp rcx, 256; jae pl_init_zero_end`) instead of leaving it caller-owned pre-init -- this removes the precondition that every caller must pre-zero the struct for an M1-002+ reserved-region reader to trust an unset field as 0. Return xor rax, rax (0=OK) -- rax is still 0 after the zero loop since the loop's fill value (rax) is never modified once set. No validation at this landing -- caller bugs (null state_ptr, row_cap==0) surface as segfaults or wrong-row data; the PL_ERR_* sentinels reserved above land defensive gates at M1-002. Zero pushes / pops -- no callee-save touched, no nested call. rdi/rsi/rdx/rcx are all SysV caller-save, so reusing rdx/rcx as post-store scratch is safe. Encoder discipline: no `test`, no imul, no imm64 in cmp/and, no cmp reg,[mem] (the loop bound check is `cmp rcx, 256` against a register, not memory), no and reg,imm64. Every field offset (+0/+8/+16/+24/+32) and every loop immediate (40, 256, 8, 0) fits imm8/imm32. Labels pl_init_zero_scan / pl_init_zero_end prefixed pl_, no reserved-keyword substrings. Leaf.",
       block: {
         // [+0] task_rows_ptr = rsi
         mov [rdi + 0], rsi;
@@ -365,6 +410,20 @@ module Poll = structure {
         xor rax, rax;
         mov [rdi + 8], rax;
         mov [rdi + 32], rax;
+
+        // Zero the reserved growth region [+40..+255] (27 qwords) so
+        // poll_init leaves the entire 256-byte PollState struct in a
+        // known state -- debugger audit fixup, postui-top#1 M1-001.
+        mov rcx, 40;
+        pl_init_zero_scan:
+        cmp rcx, 256;
+        jae pl_init_zero_end;
+        lea rdx, [rdi + rcx];
+        mov [rdx + 0], rax;
+        add rcx, 8;
+        jmp pl_init_zero_scan;
+        pl_init_zero_end:
+
         // rax = 0 (POSTUI_TOP_OK).
         ret
       }
@@ -387,8 +446,17 @@ module Poll = structure {
   //
   // Algorithm:
   //   1. now_tick = pl_sys_clock_ns() >> PL_TICK_SHIFT
-  //   2. If now_tick - last_poll_tick < poll_interval_ticks -> return 0
-  //      (unsigned subtract; the `< interval` branch skips.)
+  //   2. DEBUGGER AUDIT FIXUP (2026-09-07): if last_poll_tick == 0
+  //      (poll_init's pre-first-refresh sentinel), always refresh --
+  //      the landed version instead computed elapsed = now_tick - 0
+  //      = now_tick and compared THAT against poll_interval_ticks,
+  //      so a poll_tick called soon after boot (small now_tick) with
+  //      a large interval would incorrectly return "not yet" on its
+  //      very first call, contradicting this file's own documented
+  //      "the first poll_tick always fires" contract (see PollState
+  //      layout comment on last_poll_tick above). Otherwise, if
+  //      now_tick - last_poll_tick < poll_interval_ticks -> return 0
+  //      (unsigned subtract; the `< interval` branch skips).
   //   3. Iterate idx = 0 .. min(row_cap, PL_MAX_ROWS):
   //      a. pl_sys_taskinfo(idx, &_pl_scratch)
   //      b. If rax != 0 -> skip this slot (ENOENT / ESRCH / EFAULT all
@@ -419,7 +487,7 @@ module Poll = structure {
   pub let poll_tick : (u64) -> u64 !{mem, sysreg} @{} =
     fn (state_ptr: u64) -> unsafe {
       effects: {mem, sysreg}, capabilities: {},
-      justification: "postui-top.M1-001 (postui-top#1): fixed-interval task-info refresh entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=row_cap capped at PL_MAX_ROWS=64, r13=idx, r14=out_idx, r15=rows_ptr) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + POLL_OFF_LAST_POLL_TICK=32]; sub rax, rcx (elapsed_ticks; unsigned wrap OK because last_poll_tick <= now_tick always -- monotonic clock); mov rcx, [rbx + POLL_OFF_POLL_INTERVAL_TICKS=24]; cmp rax, rcx; jb pl_notyet (below = not enough elapsed). On elapsed path save now_tick via another pl_sys_clock_ns re-read (simpler than saving rax across the sub) so `last_poll_tick` gets the current monotonic snapshot at commit time; the re-read cost is one syscall per successful refresh (<= once per interval), negligible. Actually optimized: keep the original now_tick in r15 slot temporarily by pushing/popping around the subtract -- or simpler, RE-COMPUTE now_tick by pl_sys_clock_ns() >> shift AFTER the iterate step (a poll_tick refresh takes N syscalls of jitter anyway, so anchoring last_poll_tick to the post-iterate tick is more honest for the next-interval computation -- see body). Phase B (row_cap clamp): mov r12, [rbx + POLL_OFF_TASK_ROW_CAP=16]; mov rax, PL_MAX_ROWS=64; cmp r12, rax; jbe pl_cap_ok; mov r12, rax; pl_cap_ok: (r12 = min(row_cap, 64)). Phase C (rows base): mov r15, [rbx + POLL_OFF_TASK_ROWS_PTR=0]. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (out_idx=0); pl_iter_step: cmp r13, r12; jae pl_iter_end; mov rdi, r13; lea rsi, [rip + _pl_scratch]; call pl_sys_taskinfo; cmp rax, 0; jne pl_iter_skip (any non-zero return = skip slot at M1-001; -ESRCH-stops-iteration is M1-002 refinement). Then transcode: (a) pid: mov rax, [rip + _pl_scratch + 0]; shl rax, 32; shr rax, 32 (zext-low32); compute dst = r15 + r14*48 (via lea + shl+add: mov rcx, r14; shl rcx, 5 (=*32); mov rdx, r14; shl rdx, 4 (=*16); add rcx, rdx (=*48); lea rdx, [r15 + rcx]); mov [rdx + 0], rax. (b) state: mov rax, [rip + _pl_scratch + 8]; shl rax, 32; shr rax, 32; mov [rdx + 8], rax. (c) ticks_cpu: mov rax, [rip + _pl_scratch + 32]; mov [rdx + 16], rax. (d) mem_kb: mov rax, [rip + _pl_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov [rdx + 24], rax. (e) name copy + name_ptr: mov rcx, r14; shl rcx, 4 (=*16); lea rax, [rip + _pl_names]; add rax, rcx (name_slot_ptr); mov rcx, [rip + _pl_scratch + 16]; mov [rax + 0], rcx (first 8B of name); mov rcx, [rip + _pl_scratch + 24]; mov [rax + 8], rcx (second 8B); mov [rdx + 32], rax (name_ptr). (f) name_len via strnlen: xor rcx, rcx; pl_nlen_scan: cmp rcx, 16; jae pl_nlen_end; xor r8, r8; mov_b r8b, [rax + rcx]; cmp r8, 0; je pl_nlen_end; add rcx, 1; jmp pl_nlen_scan; pl_nlen_end: mov [rdx + 40], rcx (name_len 0..16). out_idx += 1: add r14, 1. pl_iter_skip: add r13, 1; jmp pl_iter_step. pl_iter_end: mov [rbx + POLL_OFF_TASK_ROW_COUNT=8], r14. Phase E (commit tick): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24; mov [rbx + POLL_OFF_LAST_POLL_TICK=32], rax. Phase F (return 1): mov rax, 1; 5-pop; ret. pl_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (row-stride multiplication uses shl+add: 48 = 32+16 = shl 5 + shl 4 + add); no `and reg, imm64` (zero-extend low-32 uses shl 32 + shr 32 rather than and rax, 0xFFFFFFFF which would need imm64 staging); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic; every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 4, 5, 16, 24, 32, 64). Byte load uses `xor r8, r8; mov_b r8b, [mem]` per the byte-load-zero-then-mov_b compliance flag. Labels prefixed pl_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pl_sys_clock_ns / pl_sys_taskinfo) are all leaf syscall wrappers per the two `pub let`s above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
+      justification: "postui-top.M1-001 (postui-top#1): fixed-interval task-info refresh entry. Register plan: 5-push callee-save prologue (rbx=state_ptr, r12=row_cap capped at PL_MAX_ROWS=64, r13=idx, r14=out_idx, r15=rows_ptr) = 40B -> SysV rsp%16==8 + 40 = rsp%16==0 for every nested call. Phase A (interval gate): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24 (ns -> 16.7ms-tick); mov rcx, [rbx + POLL_OFF_LAST_POLL_TICK=32]. DEBUGGER AUDIT FIXUP (2026-09-07): cmp rcx, 0; je pl_first_refresh -- when last_poll_tick is still the poll_init pre-first-refresh sentinel (0), skip the elapsed check entirely and fall straight through into Phase B so the very first poll_tick call always refreshes regardless of how much or little boot-uptime has elapsed, matching this file's documented contract. (The landed version instead always computed sub rax, rcx (elapsed_ticks) = now_tick - 0 = now_tick and compared that raw now_tick against poll_interval_ticks, so a poll_tick invoked shortly after boot with a large interval_ticks could return 'not yet' on its first call -- a real contract violation, not merely a documentation gap.) Otherwise (rcx != 0): sub rax, rcx (elapsed_ticks; unsigned wrap OK because last_poll_tick <= now_tick always -- monotonic clock); mov rcx, [rbx + POLL_OFF_POLL_INTERVAL_TICKS=24]; cmp rax, rcx; jb pl_notyet (below = not enough elapsed). pl_first_refresh: (falls through to Phase B; rax's now_tick value is not needed again until Phase E re-reads the clock). On elapsed path save now_tick via another pl_sys_clock_ns re-read (simpler than saving rax across the sub) so `last_poll_tick` gets the current monotonic snapshot at commit time; the re-read cost is one syscall per successful refresh (<= once per interval), negligible. Actually optimized: keep the original now_tick in r15 slot temporarily by pushing/popping around the subtract -- or simpler, RE-COMPUTE now_tick by pl_sys_clock_ns() >> shift AFTER the iterate step (a poll_tick refresh takes N syscalls of jitter anyway, so anchoring last_poll_tick to the post-iterate tick is more honest for the next-interval computation -- see body). Phase B (row_cap clamp): mov r12, [rbx + POLL_OFF_TASK_ROW_CAP=16]; mov rax, PL_MAX_ROWS=64; cmp r12, rax; jbe pl_cap_ok; mov r12, rax; pl_cap_ok: (r12 = min(row_cap, 64)). Phase C (rows base): mov r15, [rbx + POLL_OFF_TASK_ROWS_PTR=0]. Phase D (iterate): xor r13, r13 (idx=0); xor r14, r14 (out_idx=0); pl_iter_step: cmp r13, r12; jae pl_iter_end; mov rdi, r13; lea rsi, [rip + _pl_scratch]; call pl_sys_taskinfo; cmp rax, 0; jne pl_iter_skip (any non-zero return = skip slot at M1-001; -ESRCH-stops-iteration is M1-002 refinement). Then transcode: (a) pid: mov rax, [rip + _pl_scratch + 0]; shl rax, 32; shr rax, 32 (zext-low32); compute dst = r15 + r14*48 (via lea + shl+add: mov rcx, r14; shl rcx, 5 (=*32); mov rdx, r14; shl rdx, 4 (=*16); add rcx, rdx (=*48); lea rdx, [r15 + rcx]); mov [rdx + 0], rax. (b) state: mov rax, [rip + _pl_scratch + 8]; shl rax, 32; shr rax, 32; mov [rdx + 8], rax. (c) ticks_cpu: mov rax, [rip + _pl_scratch + 32]; mov [rdx + 16], rax. (d) mem_kb: mov rax, [rip + _pl_scratch + 40]; shl rax, 2 (pages -> KiB, 4KiB pages); mov [rdx + 24], rax. (e) name copy + name_ptr: mov rcx, r14; shl rcx, 4 (=*16); lea rax, [rip + _pl_names]; add rax, rcx (name_slot_ptr); mov rcx, [rip + _pl_scratch + 16]; mov [rax + 0], rcx (first 8B of name); mov rcx, [rip + _pl_scratch + 24]; mov [rax + 8], rcx (second 8B); mov [rdx + 32], rax (name_ptr). (f) name_len via strnlen: xor rcx, rcx; pl_nlen_scan: cmp rcx, 16; jae pl_nlen_end; xor r8, r8; mov_b r8b, [rax + rcx]; cmp r8, 0; je pl_nlen_end; add rcx, 1; jmp pl_nlen_scan; pl_nlen_end: mov [rdx + 40], rcx (name_len 0..16). out_idx += 1: add r14, 1. pl_iter_skip: add r13, 1; jmp pl_iter_step. pl_iter_end: mov [rbx + POLL_OFF_TASK_ROW_COUNT=8], r14. Phase E (commit tick): call pl_sys_clock_ns; shr rax, PL_TICK_SHIFT=24; mov [rbx + POLL_OFF_LAST_POLL_TICK=32], rax. Phase F (return 1): mov rax, 1; 5-pop; ret. pl_notyet: xor rax, rax; 5-pop; ret. Encoder discipline: no `test` (every zero-check via cmp reg, 0); no imul (row-stride multiplication uses shl+add: 48 = 32+16 = shl 5 + shl 4 + add); no `and reg, imm64` (zero-extend low-32 uses shl 32 + shr 32 rather than and rax, 0xFFFFFFFF which would need imm64 staging); no `cmp reg, [mem]` (every compare loads through a scratch first); no `mul` mnemonic; every immediate in cmp/shr/shl fits imm8 (0, 1, 2, 4, 5, 16, 24, 32, 64). Byte load uses `xor r8, r8; mov_b r8b, [mem]` per the byte-load-zero-then-mov_b compliance flag. Labels prefixed pl_ (substring \"loop\" avoided defensively; encoder-reserved keywords never appear). Cross-module calls (pl_sys_clock_ns / pl_sys_taskinfo) are all leaf syscall wrappers per the two `pub let`s above -- no additional stack pad needed at the callsite; the 5-push prologue already aligns rsp%16==0.",
       block: {
         push rbx;
         push r12;
@@ -433,13 +501,20 @@ module Poll = structure {
         // now_tick = pl_sys_clock_ns() >> PL_TICK_SHIFT
         call pl_sys_clock_ns;
         shr rax, 24;                               // rax = now_tick
-        // elapsed = now_tick - last_poll_tick
         mov rcx, [rbx + 32];                       // rcx = last_poll_tick
+        // DEBUGGER AUDIT FIXUP: last_poll_tick==0 is poll_init's
+        // pre-first-refresh sentinel -- force the first refresh
+        // unconditionally instead of comparing raw now_tick against
+        // poll_interval_ticks (see justification above).
+        cmp rcx, 0;
+        je pl_first_refresh;
+        // elapsed = now_tick - last_poll_tick
         sub rax, rcx;                              // rax = elapsed_ticks
         // if elapsed < interval: return 0
         mov rcx, [rbx + 24];                       // rcx = poll_interval_ticks
         cmp rax, rcx;
         jb pl_notyet;
+        pl_first_refresh:
 
         // ---- Phase B: row_cap clamp ----------------------------------------
         mov r12, [rbx + 16];                       // r12 = task_row_cap
